@@ -1,0 +1,14 @@
+*__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+tmp*/
+
+# Local/Kaggle runtime artifacts
+rag_runtime/
+storage/
+rag_artifacts.zip
+
+# Local environments and secrets
+.venv/
+.env
