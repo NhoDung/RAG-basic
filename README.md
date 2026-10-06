@@ -4,13 +4,15 @@ End-to-end Vietnamese RAG pipeline designed for a free Kaggle GPU session:
 
 ```text
 PDF / DOCX / Excel
-→ native parsing + PaddleOCR-VL-1.6
-→ Parent–Child chunking
+→ validation + native parsing + PaddleOCR-VL-1.6 (+ Qwen2.5-VL tuỳ chọn)
+→ document graph (caption, tham chiếu, chart → bảng nguồn, bảng nối trang)
+→ Parent–Child chunking theo modality
 → BGE dense embedding + BM25
-→ Qdrant + RRF
+→ Qdrant + RRF (+ query rewrite và filter tuỳ chọn)
 → bge-reranker-v2-m3
-→ Qwen2.5-7B-Instruct
-→ Gradio answer with citations
+→ parent/relationship expansion + structured computation
+→ Qwen2.5-7B-Instruct (JSON answer + source IDs)
+→ guardrails + Gradio answer with citations, trace và evaluation
 ```
 
 ## Chạy trên Kaggle
@@ -19,7 +21,8 @@ PDF / DOCX / Excel
 2. Chọn GPU T4/P100 và bật Internet.
 3. Chạy lần lượt các cell.
 4. Trong Gradio, upload tài liệu ở tab `Ingestion`, sau đó hỏi ở tab `Chat`.
-5. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc.
+5. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc. Lần sau có thể khôi phục bằng
+   `pipeline.restore_artifacts(...)` hoặc tab `System`.
 
 Notebook tự clone repository này. Vì vậy cần push phiên bản source code mới nhất lên
 GitHub trước khi chạy notebook đã upload độc lập.
@@ -31,26 +34,60 @@ from pathlib import Path
 
 from rag_kaggle import PipelineConfig, RAGPipeline
 
-config = PipelineConfig(work_dir=Path("/kaggle/working/rag_runtime"))
+config = PipelineConfig.from_yaml("configs/baseline.yaml")
+config.work_dir = Path("/kaggle/working/rag_runtime")
 pipeline = RAGPipeline(config)
 
-report = pipeline.ingest(["/kaggle/input/my-documents/report.pdf"])
+report = pipeline.ingest(["/kaggle/input/my-documents/report.pdf"])  # reset=True để làm lại index
 result = pipeline.ask("Quy trình phê duyệt gồm những bước nào?")
-print(result)
+print(result["answer"], result["citations"], result["warnings"])
+
+metrics = pipeline.evaluate("evaluation/dataset.sample.jsonl")
 ```
 
 ## Cấu trúc chính
 
 ```text
 rag_kaggle/
-├── parsers.py          # PDF, DOCX, Excel
-├── paddleocr_vl.py     # PaddleOCR-VL compatibility adapter
-├── chunking.py         # Parent–Child chunking
-├── storage.py          # SQLite, Qdrant, BM25, dense embedding
-├── retrieval.py        # RRF, reranker, parent expansion
-├── generation.py       # Query rewrite và Qwen answer
-├── pipeline.py         # End-to-end orchestration
-└── ui.py               # Gradio demo
+├── config.py           # Cấu hình dataclass, nạp từ YAML (configs/baseline.yaml)
+├── models.py           # Canonical Document Model: Document, Block, Relationship, Chunk
+├── ingestion.py        # Validate file (định dạng, kích thước, mật khẩu, macro), LibreOffice
+├── parsers.py          # PDF (heading theo font, bảng, scan), DOCX, Excel (KPI, chart, merged cells)
+├── paddleocr_vl.py     # PaddleOCR-VL adapter: text + layout blocks + raw output
+├── vision.py           # Qwen2.5-VL cho flowchart/chart (JSON, retry, needs_review)
+├── relationships.py    # Document graph (§5.3)
+├── chunking.py         # Parent–Child chunking theo modality
+├── storage.py          # SQLite, Qdrant (named vector, filter), BM25, embedding cache
+├── retrieval.py        # RRF, reranker, parent + relationship expansion, citation
+├── computation.py      # Tổng/trung bình/min/max/đếm trên bảng gốc bằng Python
+├── generation.py       # Query rewrite có cấu trúc và Qwen answer dạng JSON
+├── guardrails.py       # Prompt injection, PII masking, confidence, kiểm tra số liệu
+├── tracing.py          # trace_id + JSONL log theo stage
+├── evaluation.py       # Recall@k, MRR, correctness, citation/refusal accuracy
+├── pipeline.py         # End-to-end orchestration, manifest, export/restore artifacts
+└── ui.py               # Gradio: Ingestion, Chat, Evaluation, System
 ```
 
 Thiết kế chi tiết nằm trong [`Architecture.md`](Architecture.md).
+
+## Khác biệt có chủ đích so với Architecture.md
+
+- **Docling chưa được dùng**: parser hiện dùng PyMuPDF/python-docx/openpyxl trực tiếp, cộng
+  PaddleOCR-VL cho trang scan. Docling kéo theo nhiều dependency nặng dễ xung đột với
+  PaddlePaddle trên Kaggle; có thể thêm sau như một parser bổ sung.
+- **Dense model mặc định là `BAAI/bge-m3`** (fallback trong kiến trúc) vì `bge-multilingual-gemma2`
+  không vừa GPU T4 khi chạy cùng Qwen 7B.
+- **Cấu trúc package phẳng** `rag_kaggle/` thay vì chia nhiều package như §17, để notebook Kaggle
+  import đơn giản.
+- **BM25 là index local** (`bm25.pkl`), được §8.2 cho phép thay cho sparse vector trong Qdrant.
+- **Recalculation công thức Excel** chưa tự động; số cell công thức thiếu cached value được ghi
+  cảnh báo trong ingestion report.
+
+## Test
+
+```bash
+pip install pymupdf python-docx openpyxl pandas pyarrow pillow rank-bm25 qdrant-client numpy pyyaml
+python -m unittest discover -s tests
+```
+
+Test end-to-end dùng encoder giả lập và LLM giả lập nên không cần GPU.

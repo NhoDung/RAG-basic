@@ -32,7 +32,7 @@ Trước khi chạy:
 2. Bật **Internet** để tải dependency và model lần đầu.
 3. Chạy lần lượt các cell. Cell cuối mở giao diện upload và chat.
 
-Preset mặc định dùng `BAAI/bge-m3` vì `bge-multilingual-gemma2` quá nặng khi chạy cùng Qwen 7B trên T4.
+Preset mặc định dùng `BAAI/bge-m3` vì `bge-multilingual-gemma2` quá nặng khi chạy cùng Qwen 7B trên T4.\nLibreOffice (tuỳ chọn) giúp đọc `.xls` đầy đủ hơn: `!apt-get install -y libreoffice-calc`.
 """
     ),
     markdown("## 1. Clone hoặc sử dụng source code hiện có"),
@@ -91,26 +91,23 @@ from rag_kaggle import PipelineConfig, RAGPipeline
     code(
         """from pathlib import Path
 
-config = PipelineConfig(work_dir=Path("/kaggle/working/rag_runtime"))
+# Preset §16 Architecture.md; chỉnh trực tiếp trên object nếu cần.
+config = PipelineConfig.from_yaml(PROJECT_DIR / "configs" / "baseline.yaml")
+config.work_dir = Path("/kaggle/working/rag_runtime")
 
 # OCR/document vision
-config.parsing.ocr_model_name = "PaddleOCR-VL-1.6"
 config.parsing.ocr_model_dir = None  # Đặt path Kaggle Dataset nếu chạy offline.
-config.parsing.render_dpi = 220
-config.parsing.enable_ocr = True
 
-# Dense retrieval: preset thực tế cho T4.
+# Dense retrieval: bge-m3 cho T4. Nếu đổi sang BAAI/bge-multilingual-gemma2 thì phải
+# re-ingest với reset=True (không trộn 2 dense model trong một index) và đặt
+# config.retrieval.dense_query_instruction theo model card.
 config.retrieval.dense_model = "BAAI/bge-m3"
-config.retrieval.dense_device = "cuda"
-config.retrieval.dense_batch_size = 4
 
-# Có thể tắt khi muốn test nhanh hoặc thiếu VRAM.
+# VLM Qwen2.5-VL-3B cho flowchart/chart phức tạp: tắt mặc định để tiết kiệm GPU.
+config.vision.enabled = False
+
+# Có thể tắt reranker khi muốn test nhanh hoặc thiếu VRAM.
 config.retrieval.reranker_enabled = True
-config.retrieval.reranker_model = "BAAI/bge-reranker-v2-m3"
-
-# Local answer model.
-config.generation.model = "Qwen/Qwen2.5-7B-Instruct"
-config.generation.load_in_4bit = True
 config.generation.query_rewrite_enabled = False
 
 pipeline = RAGPipeline(config)
@@ -119,28 +116,47 @@ print("Initial DB stats:", pipeline.metadata.stats())
 """
     ),
     markdown(
-        """## 5. Chạy Gradio
+        """## 5. (Tuỳ chọn) Khôi phục index đã export
 
-Trong tab **Ingestion**, upload PDF/DOCX/XLSX rồi bấm **Parse và lập chỉ mục**. Sau khi hoàn tất, chuyển sang tab **Chat**.
+Nếu đã upload `rag_artifacts.zip` thành Kaggle Dataset, khôi phục để chat ngay mà không cần ingest lại.
+"""
+    ),
+    code(
+        """ARTIFACTS = None  # ví dụ: "/kaggle/input/my-rag-artifacts/rag_artifacts.zip"
+if ARTIFACTS:
+    print(pipeline.restore_artifacts(ARTIFACTS))
+"""
+    ),
+    markdown(
+        """## 6. Chạy Gradio
+
+- **Ingestion**: upload PDF/DOCX/XLSX rồi bấm **Parse và lập chỉ mục**. Mặc định index được cộng dồn;
+  tick "Xoá toàn bộ index cũ" để làm lại từ đầu. File không đổi sẽ được bỏ qua.
+- **Chat**: hỏi đáp, xem citation, retrieved chunks, điểm dense/BM25/RRF/rerank, preview ảnh nguồn và trace.
+- **Evaluation**: upload dataset JSONL (xem `evaluation/dataset.sample.jsonl`).
+- **System**: thống kê, trạng thái từng stage, khôi phục artifacts.
 
 Lần chạy đầu sẽ tải model nên mất thời gian. Không đóng session trong lúc model đang tải.
 """
     ),
     code(
-        """from rag_kaggle.ui import build_demo
+        """from rag_kaggle.ui import launch_demo
 
-demo = build_demo(pipeline)
-demo.queue(default_concurrency_limit=1).launch(share=True, debug=False)
+launch_demo(pipeline, share=True, debug=False)
 """
     ),
-    markdown("## 6. API Python trực tiếp và export artifacts"),
+    markdown("## 7. API Python trực tiếp, evaluation và export artifacts"),
     code(
-        """# Có thể dùng trực tiếp thay cho Gradio:
-# report = pipeline.ingest(["/kaggle/input/my-data/file.pdf"], reset=True)
+        """# report = pipeline.ingest(["/kaggle/input/my-data/file.pdf"])          # cộng dồn
+# report = pipeline.ingest([...], reset=True)                               # làm lại từ đầu
 # result = pipeline.ask("Phí thường niên của thẻ là bao nhiêu?")
-# print(result)
+# print(result["answer"], result["citations"], result["warnings"])
 
-# Export Qdrant, SQLite, parsed JSON và assets trước khi session kết thúc:
+# Evaluation (§14):
+# metrics = pipeline.evaluate("/kaggle/input/my-eval/dataset.jsonl", run_answers=True)
+# print(metrics["retrieval"], metrics["answer"])
+
+# Export Qdrant, SQLite, parsed JSON/Parquet, assets, manifest trước khi session kết thúc:
 # archive = pipeline.export_artifacts("/kaggle/working/rag_artifacts.zip")
 # print(archive)
 """

@@ -1,0 +1,68 @@
+# Baseline preset for a Kaggle T4/P100 session (§16 Architecture.md).
+# Load with: PipelineConfig.from_yaml("configs/baseline.yaml")
+work_dir: /kaggle/working/rag_runtime
+collection_name: rag_chunks
+
+ingestion:
+  max_file_mb: 200
+  skip_unchanged_documents: true
+
+parsing:
+  render_dpi: 220
+  enable_ocr: true
+  ocr_model_name: PaddleOCR-VL-1.6
+  ocr_model_dir: null          # Kaggle Dataset path when running offline
+  ocr_images_in_digital_docs: true
+  include_hidden_sheets: false
+  include_hidden_rows_columns: false
+  write_table_parquet: true
+
+vision:
+  enabled: false               # Bật khi evaluation cho thấy cần hiểu flowchart/dashboard
+  model: Qwen/Qwen2.5-VL-3B-Instruct
+  load_in_4bit: true
+  max_retries: 2
+
+chunking:
+  child_chars: 1800            # ~450 tokens
+  child_overlap_chars: 240     # ~60 tokens
+  parent_chars: 7500           # ~2000 tokens
+  table_rows_per_chunk: 15
+  table_max_columns_per_chunk: 8
+  table_key_columns: 1
+
+retrieval:
+  # Mục tiêu kiến trúc là BAAI/bge-multilingual-gemma2 (cần query instruction),
+  # nhưng trên T4 cùng Qwen 7B nên dùng bge-m3. Không trộn 2 model trong 1 index.
+  dense_model: BAAI/bge-m3
+  dense_fallback_model: BAAI/bge-m3
+  dense_batch_size: 4
+  dense_top_k: 30
+  sparse_top_k: 30
+  rrf_k: 60
+  fused_top_k: 30
+  rerank_top_k: 8
+  reranker_enabled: true
+  reranker_model: BAAI/bge-reranker-v2-m3
+  expand_relationships: true
+
+generation:
+  model: Qwen/Qwen2.5-7B-Instruct
+  load_in_4bit: true
+  max_context_chars: 28000
+  max_new_tokens: 1024
+  temperature: 0.1
+  query_rewrite_enabled: false
+  query_rewrite_count: 2
+  structured_computation_enabled: true
+
+guardrails:
+  enabled: true
+  min_rerank_score: 0.05
+  detect_prompt_injection: true
+  mask_pii_in_logs: true
+  validate_numbers: true
+
+runtime:
+  unload_models_between_stages: true
+  log_traces: true

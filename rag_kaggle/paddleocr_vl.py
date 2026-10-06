@@ -60,11 +60,17 @@ class PaddleOCRVLAdapter:
         self.load()
         results = list(self.pipeline.predict(str(image_path)))
         raw = [self._to_serializable(result) for result in results]
-        text_parts = []
+        blocks = []
         for item in raw:
-            text_parts.extend(self._collect_text(item))
-        text = "\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
-        return {"text": text, "raw": raw, "model": self.model_name}
+            blocks.extend(self._collect_layout_blocks(item))
+        if blocks:
+            text = "\n\n".join(block["content"] for block in blocks if block["content"])
+        else:
+            text_parts = []
+            for item in raw:
+                text_parts.extend(self._collect_text(item))
+            text = "\n".join(dict.fromkeys(part.strip() for part in text_parts if part.strip()))
+        return {"text": text, "blocks": blocks, "raw": raw, "model": self.model_name}
 
     def unload(self) -> None:
         self.pipeline = None
@@ -115,6 +121,43 @@ class PaddleOCRVLAdapter:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
+
+    def _collect_layout_blocks(self, value: Any) -> list[dict[str, Any]]:
+        """Extract layout blocks (label, content, bbox, order) in reading order.
+
+        PaddleOCR-VL exposes them as ``parsing_res_list`` entries with keys such as
+        ``block_label``/``block_content``/``block_bbox``; field names differ between
+        releases, so several aliases are accepted.
+        """
+        label_keys = ("block_label", "label", "type")
+        content_keys = ("block_content", "content", "text", "markdown", "html")
+        bbox_keys = ("block_bbox", "bbox", "coordinate", "box")
+        blocks: list[dict[str, Any]] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                label = next((node[key] for key in label_keys if isinstance(node.get(key), str)), None)
+                content = next((node[key] for key in content_keys if isinstance(node.get(key), str)), None)
+                if label and content and content.strip():
+                    bbox = next((node[key] for key in bbox_keys if isinstance(node.get(key), list)), None)
+                    score = node.get("score", node.get("confidence"))
+                    blocks.append(
+                        {
+                            "label": label.lower(),
+                            "content": content.strip(),
+                            "bbox": bbox if bbox and all(isinstance(v, (int, float)) for v in bbox) else None,
+                            "confidence": float(score) if isinstance(score, (int, float)) else None,
+                        }
+                    )
+                    return
+                for item in node.values():
+                    visit(item)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(value)
+        return blocks
 
     def _collect_text(self, value: Any) -> list[str]:
         text_keys = {

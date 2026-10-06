@@ -1,0 +1,7 @@
+// Mẫu dataset đánh giá (§14.1). Mỗi dòng là một JSON object; dòng bắt đầu bằng // bị bỏ qua.
+// expected_location có thể gồm: page, sheet_name, cell_range, section. expected_block_ids là tuỳ chọn.
+// Đặt "no_answer": true (hoặc expected_answer null) cho câu hỏi không có đáp án.
+{"question": "Phí thường niên của thẻ Visa Gold là bao nhiêu?", "expected_answer": "499.000 VND", "expected_document": "bieu_phi.pdf", "expected_location": {"page": 12}, "content_type": "table", "category": "table_lookup"}
+{"question": "Tổng doanh thu các chi nhánh năm 2025 là bao nhiêu?", "expected_answer": "12.500", "expected_document": "bao_cao.xlsx", "expected_location": {"sheet_name": "Doanh thu", "cell_range": "A4:E19"}, "content_type": "table", "category": "table_aggregation"}
+{"question": "Hồ sơ vay được chuyển cho ai sau bước thẩm định?", "expected_answer": "Trưởng phòng tín dụng", "expected_document": "quy_trinh.docx", "expected_location": {"section": "Phê duyệt khoản vay"}, "content_type": "flowchart", "category": "flowchart_logic"}
+{"question": "Lãi suất tiền gửi kỳ hạn 100 năm là bao nhiêu?", "expected_answer": null, "no_answer": true, "category": "no_answer"}
