@@ -88,9 +88,10 @@ class VisionReasoner:
                 bnb_4bit_use_double_quant=True,
             )
         self.processor = AutoProcessor.from_pretrained(self.config.vision.model)
+        device_map = {"": self.config.vision.device} if self.config.vision.device else "auto"
         self.model = ModelClass.from_pretrained(
             self.config.vision.model,
-            device_map="auto",
+            device_map=device_map,
             torch_dtype="auto",
             quantization_config=quantization_config,
         )

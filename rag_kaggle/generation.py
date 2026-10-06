@@ -65,10 +65,11 @@ class LocalQwen:
             self.config.generation.model,
             trust_remote_code=True,
         )
+        device_map = {"": self.config.generation.device} if self.config.generation.device else "auto"
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.generation.model,
             trust_remote_code=True,
-            device_map="auto",
+            device_map=device_map,
             torch_dtype="auto",
             quantization_config=quantization_config,
         )

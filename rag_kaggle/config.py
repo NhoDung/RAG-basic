@@ -23,6 +23,9 @@ class ParsingConfig:
     enable_ocr: bool = True
     ocr_model_name: str = "PaddleOCR-VL-1.6"
     ocr_model_dir: str | None = None
+    # Physical GPU exposed to the isolated PaddleOCR worker. For example, "0".
+    # None leaves CUDA_VISIBLE_DEVICES unchanged.
+    ocr_cuda_visible_devices: str | None = None
     # Python of a separate venv with paddlepaddle-gpu + paddleocr (recommended on
     # Kaggle). None runs PaddleOCR-VL inside the current process.
     ocr_python: str | None = None
@@ -47,6 +50,8 @@ class VisionConfig:
     max_retries: int = 2
     min_ocr_chars_for_skip: int = 0
     image_types: tuple[str, ...] = ("flowchart", "chart", "diagram")
+    # Set by the Kaggle device planner. None delegates placement to Transformers.
+    device: str | None = None
 
 
 @dataclass
@@ -77,6 +82,9 @@ class RetrievalConfig:
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_use_fp16: bool = True
     reranker_batch_size: int = 16
+    # FlagEmbedding accepts an explicit device in current releases. Keeping this
+    # separate from dense_device lets a dual-T4 notebook reserve GPU 1 for retrieval.
+    reranker_device: str = "cuda"
     expand_relationships: bool = True
     max_related_blocks: int = 6
     max_parent_chars_in_context: int = 6000
@@ -92,6 +100,8 @@ class GenerationConfig:
     query_rewrite_enabled: bool = False
     query_rewrite_count: int = 2
     structured_computation_enabled: bool = True
+    # Set to e.g. "cuda:0" for a single-device Qwen placement. None uses auto placement.
+    device: str | None = None
 
 
 @dataclass

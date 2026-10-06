@@ -12,6 +12,7 @@ from rag_kaggle.config import ChunkingConfig, PipelineConfig
 from rag_kaggle.evaluation import answer_correct, hit_matches, retrieval_metrics
 from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
+from rag_kaggle.hardware import configure_kaggle_devices
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
 from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.parsers import classify_excel_region, rows_to_markdown
@@ -138,6 +139,23 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(3, config.retrieval.rerank_top_k)
         with self.assertRaises(KeyError):
             PipelineConfig.from_dict({"retrieval": {"unknown": 1}})
+
+    def test_dual_t4_device_layout(self):
+        config = PipelineConfig()
+        layout = configure_kaggle_devices(config, gpu_count=2)
+        self.assertEqual("dual_t4", layout["mode"])
+        self.assertEqual("0", config.parsing.ocr_cuda_visible_devices)
+        self.assertEqual("cuda:1", config.retrieval.dense_device)
+        self.assertEqual("cuda:1", config.retrieval.reranker_device)
+        self.assertEqual("cuda:0", config.generation.device)
+        self.assertEqual("cuda:0", config.vision.device)
+
+    def test_single_gpu_device_layout(self):
+        config = PipelineConfig()
+        layout = configure_kaggle_devices(config, gpu_count=1)
+        self.assertEqual("single_gpu", layout["mode"])
+        self.assertEqual("cuda:0", config.retrieval.dense_device)
+        self.assertEqual("cuda:0", config.retrieval.reranker_device)
 
 
 class ChunkingTests(unittest.TestCase):

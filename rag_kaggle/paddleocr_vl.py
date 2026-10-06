@@ -41,11 +41,13 @@ class PaddleOCRVLAdapter:
         model_dir: str | None = None,
         python_executable: str | None = None,
         log_path: str | Path | None = None,
+        cuda_visible_devices: str | None = None,
     ):
         self.model_name = model_name
         self.model_dir = model_dir
         self.python_executable = python_executable
         self.log_path = Path(log_path) if log_path else None
+        self.cuda_visible_devices = cuda_visible_devices
         self.pipeline = None
         self.load_error: str | None = None
         self._worker: subprocess.Popen | None = None
@@ -157,6 +159,8 @@ class PaddleOCRVLAdapter:
             command += ["--model-dir", self.model_dir]
         env = {key: value for key, value in os.environ.items() if key not in ("PYTHONPATH", "PYTHONHOME")}
         env.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        if self.cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = self.cuda_visible_devices
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self._worker_log = self.log_path.open("a", encoding="utf-8")

@@ -30,10 +30,17 @@ class Reranker:
             return
         from FlagEmbedding import FlagReranker
 
-        self.model = FlagReranker(
-            self.config.retrieval.reranker_model,
-            use_fp16=self.config.retrieval.reranker_use_fp16,
-        )
+        kwargs = {
+            "use_fp16": self.config.retrieval.reranker_use_fp16,
+            "devices": self.config.retrieval.reranker_device,
+        }
+        try:
+            self.model = FlagReranker(self.config.retrieval.reranker_model, **kwargs)
+        except TypeError:
+            # Old FlagEmbedding releases did not expose ``devices``. The Kaggle
+            # requirements pin a new enough version, but this keeps local use usable.
+            kwargs.pop("devices")
+            self.model = FlagReranker(self.config.retrieval.reranker_model, **kwargs)
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         if not self.config.retrieval.reranker_enabled or not texts:

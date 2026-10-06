@@ -28,7 +28,8 @@ Pipeline: **PDF/DOCX/Excel → PaddleOCR-VL-1.6 → Parent–Child → BGE → Q
 
 Trước khi chạy:
 
-1. Chọn Accelerator là **GPU T4** (T4 x2 cũng được). **Không dùng P100**: PaddleOCR-VL cần GPU
+1. Chọn Accelerator là **GPU T4 x2**. Notebook tự pin PaddleOCR-VL/Qwen vào GPU 0 và
+   embedding/reranker vào GPU 1. **Không dùng P100**: PaddleOCR-VL cần GPU
    compute capability ≥ 7.0, P100 chỉ có 6.0.
 2. Bật **Internet** để tải dependency và model lần đầu.
 3. Chạy lần lượt các cell. Cell **Smoke test** kiểm tra toàn bộ pipeline trên tài liệu mẫu trước khi
@@ -147,7 +148,7 @@ if torch.cuda.is_available():
 else:
     print("⚠️ Không thấy GPU. Vào Settings > Accelerator và chọn GPU T4.")
 
-from rag_kaggle import PipelineConfig, RAGPipeline
+from rag_kaggle import PipelineConfig, RAGPipeline, configure_kaggle_devices
 """
     ),
     markdown("## 5. Cấu hình baseline chạy được trên T4"),
@@ -163,6 +164,13 @@ config.parsing.ocr_python = OCR_PYTHON
 config.parsing.enable_ocr = OCR_PYTHON is not None
 config.parsing.ocr_model_dir = None  # Đặt path Kaggle Dataset nếu chạy offline.
 
+# Kaggle hiện thường cấp T4 x2. Phân vai GPU thay vì shard Qwen 7B qua 2 GPU:
+# GPU 0: PaddleOCR-VL worker, Qwen answer và Qwen-VL optional.
+# GPU 1: BGE dense embedding và bge reranker.
+# Nếu chỉ có một GPU, helper tự fallback toàn bộ về cuda:0.
+device_layout = configure_kaggle_devices(config)
+print("Device layout:", device_layout)
+
 # Dense retrieval: bge-m3 cho T4. Nếu đổi sang BAAI/bge-multilingual-gemma2 thì phải
 # re-ingest với reset=True (không trộn 2 dense model trong một index) và đặt
 # config.retrieval.dense_query_instruction theo model card.
@@ -176,6 +184,19 @@ config.retrieval.reranker_enabled = True
 config.generation.query_rewrite_enabled = False
 
 print("OCR enabled:", config.parsing.enable_ocr)
+print("Dense device:", config.retrieval.dense_device)
+print("Reranker device:", config.retrieval.reranker_device)
+print("Qwen device:", config.generation.device or "auto")
+
+try:
+    print(subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout)
+except Exception as exc:
+    print("Không đọc được nvidia-smi:", exc)
 """
     ),
     markdown(

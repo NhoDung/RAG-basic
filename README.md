@@ -18,7 +18,9 @@ PDF / DOCX / Excel
 ## Chạy trên Kaggle
 
 1. Upload [`notebooks/kaggle_full_pipeline.ipynb`](notebooks/kaggle_full_pipeline.ipynb) lên Kaggle.
-2. Chọn GPU **T4** và bật Internet. Không dùng P100: PaddleOCR-VL cần compute capability ≥ 7.0.
+2. Chọn GPU **T4 x2** và bật Internet. Notebook pin PaddleOCR-VL/Qwen vào GPU 0, BGE/reranker
+   vào GPU 1; nếu Kaggle chỉ cấp một GPU thì tự fallback về GPU 0. Không dùng P100:
+   PaddleOCR-VL cần compute capability ≥ 7.0.
 3. Chạy lần lượt các cell. PaddleOCR-VL được cài vào venv riêng (`/tmp/paddle_env`) với
    `paddlepaddle-gpu` 3.x từ index chính thức của Paddle và được gọi qua subprocess, nên không
    xung đột CUDA/cuDNN với PyTorch.
@@ -97,3 +99,17 @@ python -m unittest discover -s tests
 ```
 
 Test end-to-end dùng encoder giả lập và LLM giả lập nên không cần GPU.
+
+## T4 x2
+
+Notebook không tensor-parallel Qwen 7B qua hai T4 vì model 4-bit đã vừa một T4 và
+cross-GPU transfer có thể làm chat chậm hơn. Thay vào đó, `configure_kaggle_devices`
+phân vai cố định:
+
+```text
+GPU 0: PaddleOCR-VL worker -> Qwen answer -> Qwen-VL optional
+GPU 1: BGE-M3 dense embedding + bge-reranker-v2-m3
+```
+
+Nhờ vậy Qwen có thể giữ warm trên GPU 0 trong khi query embedding và rerank dùng
+GPU 1. Cell cấu hình trong notebook tự kiểm tra số GPU và áp dụng layout này.

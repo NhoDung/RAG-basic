@@ -1,4 +1,4 @@
-# Baseline preset for a Kaggle T4/P100 session (§16 Architecture.md).
+# Baseline preset for a Kaggle T4 x2 session (§16 Architecture.md).
 # Load with: PipelineConfig.from_yaml("configs/baseline.yaml")
 work_dir: /kaggle/working/rag_runtime
 collection_name: rag_chunks
@@ -12,6 +12,7 @@ parsing:
   enable_ocr: true
   ocr_model_name: PaddleOCR-VL-1.6
   ocr_model_dir: null          # Kaggle Dataset path when running offline
+  ocr_cuda_visible_devices: null # Notebook tự chọn GPU 0 khi T4 x2
   ocr_images_in_digital_docs: true
   include_hidden_sheets: false
   include_hidden_rows_columns: false
@@ -22,6 +23,7 @@ vision:
   model: Qwen/Qwen2.5-VL-3B-Instruct
   load_in_4bit: true
   max_retries: 2
+  device: null                   # Notebook tự chọn GPU 0 khi T4 x2
 
 chunking:
   child_chars: 1800            # ~450 tokens
@@ -44,6 +46,7 @@ retrieval:
   rerank_top_k: 8
   reranker_enabled: true
   reranker_model: BAAI/bge-reranker-v2-m3
+  reranker_device: cuda          # Notebook đổi thành cuda:1 khi T4 x2
   expand_relationships: true
 
 generation:
@@ -55,6 +58,7 @@ generation:
   query_rewrite_enabled: false
   query_rewrite_count: 2
   structured_computation_enabled: true
+  device: null                   # Notebook tự chọn GPU 0 khi T4 x2
 
 guardrails:
   enabled: true

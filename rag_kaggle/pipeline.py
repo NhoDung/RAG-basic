@@ -45,6 +45,7 @@ class RAGPipeline:
             model_dir=self.config.parsing.ocr_model_dir,
             python_executable=self.config.parsing.ocr_python,
             log_path=self.config.log_dir / "ocr_worker.log",
+            cuda_visible_devices=self.config.parsing.ocr_cuda_visible_devices,
         )
         self.vision = VisionReasoner(self.config)
         self.parser = DocumentParser(self.config, self.ocr, self.vision)
