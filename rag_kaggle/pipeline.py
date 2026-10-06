@@ -43,6 +43,8 @@ class RAGPipeline:
         self.ocr = PaddleOCRVLAdapter(
             model_name=self.config.parsing.ocr_model_name,
             model_dir=self.config.parsing.ocr_model_dir,
+            python_executable=self.config.parsing.ocr_python,
+            log_path=self.config.log_dir / "ocr_worker.log",
         )
         self.vision = VisionReasoner(self.config)
         self.parser = DocumentParser(self.config, self.ocr, self.vision)

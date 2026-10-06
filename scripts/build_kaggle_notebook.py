@@ -28,14 +28,17 @@ Pipeline: **PDF/DOCX/Excel → PaddleOCR-VL-1.6 → Parent–Child → BGE → Q
 
 Trước khi chạy:
 
-1. Chọn Accelerator là **GPU T4/P100**.
+1. Chọn Accelerator là **GPU T4** (T4 x2 cũng được). **Không dùng P100**: PaddleOCR-VL cần GPU
+   compute capability ≥ 7.0, P100 chỉ có 6.0.
 2. Bật **Internet** để tải dependency và model lần đầu.
-3. Chạy lần lượt các cell. Cell cuối mở giao diện upload và chat.
+3. Chạy lần lượt các cell. Cell **Smoke test** kiểm tra toàn bộ pipeline trên tài liệu mẫu trước khi
+   mở giao diện; nếu có bước FAIL, gửi lại output của cell đó để sửa.
 
-Preset mặc định dùng `BAAI/bge-m3` vì `bge-multilingual-gemma2` quá nặng khi chạy cùng Qwen 7B trên T4.\nLibreOffice (tuỳ chọn) giúp đọc `.xls` đầy đủ hơn: `!apt-get install -y libreoffice-calc`.
+Preset mặc định dùng `BAAI/bge-m3` vì `bge-multilingual-gemma2` quá nặng khi chạy cùng Qwen 7B trên T4.
+LibreOffice (tuỳ chọn) giúp đọc `.xls` đầy đủ hơn: `!apt-get install -y libreoffice-calc`.
 """
     ),
-    markdown("## 1. Clone hoặc sử dụng source code hiện có"),
+    markdown("## 1. Clone hoặc cập nhật source code"),
     code(
         """import os
 import subprocess
@@ -46,48 +49,108 @@ REPO_URL = "https://github.com/NhoDung/RAG-basic.git"
 REPO_DIR = Path("/kaggle/working/RAG-basic")
 
 if not (Path.cwd() / "rag_kaggle").exists():
-    if not REPO_DIR.exists():
+    if REPO_DIR.exists():
+        subprocess.check_call(["git", "-C", str(REPO_DIR), "pull", "--ff-only"])
+    else:
         subprocess.check_call(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)])
     os.chdir(REPO_DIR)
 
 PROJECT_DIR = Path.cwd()
 sys.path.insert(0, str(PROJECT_DIR))
 print("Project:", PROJECT_DIR)
+print(subprocess.run(["git", "log", "-1", "--oneline"], capture_output=True, text=True).stdout)
 """
     ),
-    markdown("## 2. Cài dependencies"),
+    markdown("## 2. Cài dependencies cho pipeline chính (PyTorch)"),
     code(
         """import subprocess
 import sys
 
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "-q", "-r", "requirements-kaggle.txt"
-])
-
-# PaddleOCR-VL requires PaddlePaddle plus the document-parser extras.
-# Override these specs in the cell if the official Paddle release notes for the
-# current Kaggle CUDA image require a different wheel.
-PADDLE_SPEC = "paddlepaddle-gpu"
-PADDLEOCR_SPEC = "paddleocr[doc-parser]"
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", PADDLE_SPEC])
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", PADDLEOCR_SPEC])
-
-print("Dependencies installed. If Paddle asks for a restart, use Run > Restart session once.")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements-kaggle.txt"])
+print("Main dependencies installed.")
 """
     ),
-    markdown("## 3. Kiểm tra GPU và import pipeline"),
+    markdown(
+        """## 3. Cài PaddleOCR-VL trong môi trường riêng
+
+PaddlePaddle và PyTorch dùng các bản CUDA/cuDNN khác nhau; tài liệu PaddleOCR-VL khuyên tách môi trường.
+Cell này tạo venv riêng ở `/tmp/paddle_env` (không tính vào dung lượng output), cài
+`paddlepaddle-gpu` 3.x từ index chính thức của Paddle (bản trên PyPI chỉ đến 2.6, không chạy được
+PaddleOCR-VL) và `paddleocr[doc-parser]`. Pipeline gọi OCR qua subprocess, nên PyTorch không bị ảnh hưởng
+và VRAM của OCR được giải phóng hoàn toàn sau khi parse.
+
+Nếu cài thất bại, pipeline vẫn chạy với OCR tắt (PDF có text, DOCX, Excel vẫn dùng được).
+"""
+    ),
+    code(
+        """import subprocess
+import sys
+from pathlib import Path
+
+INSTALL_OCR = True
+PADDLE_VERSION = "3.2.1"   # theo tài liệu PaddleOCR-VL
+PADDLE_CUDA = "cu126"      # đổi sang "cu118" nếu driver GPU của session quá cũ
+OCR_ENV = Path("/tmp/paddle_env")
+OCR_PYTHON = None
+
+
+def run(command):
+    print("$", " ".join(map(str, command)))
+    completed = subprocess.run(list(map(str, command)), capture_output=True, text=True)
+    if completed.returncode != 0:
+        print(completed.stdout[-2000:], completed.stderr[-3000:])
+        raise RuntimeError(f"Command failed: {command[0]} ... (exit {completed.returncode})")
+    return completed.stdout
+
+
+if INSTALL_OCR:
+    try:
+        python = OCR_ENV / "bin" / "python"
+        if not python.exists():
+            try:
+                run([sys.executable, "-m", "venv", OCR_ENV])
+            except RuntimeError:
+                run([sys.executable, "-m", "pip", "install", "-q", "virtualenv"])
+                run([sys.executable, "-m", "virtualenv", OCR_ENV])
+        pip = [python, "-m", "pip", "install", "-q"]
+        run(pip + ["--upgrade", "pip"])
+        run(pip + [
+            f"paddlepaddle-gpu=={PADDLE_VERSION}",
+            "-i", f"https://www.paddlepaddle.org.cn/packages/stable/{PADDLE_CUDA}/",
+            "--extra-index-url", "https://pypi.org/simple",
+        ])
+        run(pip + ["paddleocr[doc-parser]"])
+        check = run([python, "-c",
+                     "import paddle, paddleocr; print('paddle', paddle.__version__, 'cuda', "
+                     "paddle.device.is_compiled_with_cuda(), 'gpus', paddle.device.cuda.device_count()); "
+                     "print('paddleocr', paddleocr.__version__)"])
+        print(check)
+        OCR_PYTHON = str(python)
+    except Exception as exc:
+        print("PaddleOCR-VL setup failed; OCR will be disabled:", exc)
+
+print("OCR_PYTHON =", OCR_PYTHON)
+"""
+    ),
+    markdown("## 4. Kiểm tra GPU và import pipeline"),
     code(
         """import torch
-import paddle
 
 print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
-print("Torch GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-print("Paddle:", paddle.__version__, "CUDA build:", paddle.device.is_compiled_with_cuda())
+if torch.cuda.is_available():
+    for index in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(index)
+        print(f"GPU {index}: {props.name}, compute capability {props.major}.{props.minor}, "
+              f"{props.total_memory / 1024**3:.1f} GB")
+    if torch.cuda.get_device_properties(0).major < 7:
+        print("⚠️ GPU này không hỗ trợ PaddleOCR-VL (cần compute capability ≥ 7.0). Hãy chọn T4.")
+else:
+    print("⚠️ Không thấy GPU. Vào Settings > Accelerator và chọn GPU T4.")
 
 from rag_kaggle import PipelineConfig, RAGPipeline
 """
     ),
-    markdown("## 4. Cấu hình baseline chạy được trên T4"),
+    markdown("## 5. Cấu hình baseline chạy được trên T4"),
     code(
         """from pathlib import Path
 
@@ -95,7 +158,9 @@ from rag_kaggle import PipelineConfig, RAGPipeline
 config = PipelineConfig.from_yaml(PROJECT_DIR / "configs" / "baseline.yaml")
 config.work_dir = Path("/kaggle/working/rag_runtime")
 
-# OCR/document vision
+# OCR/document vision chạy trong venv riêng (cell 3).
+config.parsing.ocr_python = OCR_PYTHON
+config.parsing.enable_ocr = OCR_PYTHON is not None
 config.parsing.ocr_model_dir = None  # Đặt path Kaggle Dataset nếu chạy offline.
 
 # Dense retrieval: bge-m3 cho T4. Nếu đổi sang BAAI/bge-multilingual-gemma2 thì phải
@@ -110,13 +175,38 @@ config.vision.enabled = False
 config.retrieval.reranker_enabled = True
 config.generation.query_rewrite_enabled = False
 
-pipeline = RAGPipeline(config)
-print("Runtime:", config.work_dir)
-print("Initial DB stats:", pipeline.metadata.stats())
+print("OCR enabled:", config.parsing.enable_ocr)
 """
     ),
     markdown(
-        """## 5. (Tuỳ chọn) Khôi phục index đã export
+        """## 6. Smoke test toàn pipeline
+
+Chạy mọi stage trên tài liệu mẫu nhỏ trong thư mục riêng (`/kaggle/working/rag_smoke`, tự xoá sau khi
+xong): môi trường → OCR → ingest → index → retrieve/rerank → Qwen → structured computation.
+Lần đầu sẽ tải toàn bộ model (Qwen 7B khoảng 15 GB) nên có thể mất 10–20 phút.
+
+- `PASS`: stage chạy đúng. `WARN`: chạy được nhưng kết quả cần xem lại. `FAIL`: lỗi, xem `detail`.
+- Các model được unload sau smoke test, nên không chiếm GPU của pipeline chính.
+"""
+    ),
+    code(
+        """from rag_kaggle.smoke import run_smoke_test
+
+smoke = run_smoke_test(config)
+for step in smoke["steps"]:
+    if step["status"] != "PASS":
+        print(f"\\n--- {step['step']} ({step['status']}) ---\\n{step['detail']}")
+"""
+    ),
+    markdown("## 7. Khởi tạo pipeline chính"),
+    code(
+        """pipeline = RAGPipeline(config)
+print("Runtime:", config.work_dir)
+print("DB stats:", pipeline.metadata.stats())
+"""
+    ),
+    markdown(
+        """## 8. (Tuỳ chọn) Khôi phục index đã export
 
 Nếu đã upload `rag_artifacts.zip` thành Kaggle Dataset, khôi phục để chat ngay mà không cần ingest lại.
 """
@@ -128,7 +218,7 @@ if ARTIFACTS:
 """
     ),
     markdown(
-        """## 6. Chạy Gradio
+        """## 9. Chạy Gradio
 
 - **Ingestion**: upload PDF/DOCX/XLSX rồi bấm **Parse và lập chỉ mục**. Mặc định index được cộng dồn;
   tick "Xoá toàn bộ index cũ" để làm lại từ đầu. File không đổi sẽ được bỏ qua.
@@ -145,7 +235,7 @@ Lần chạy đầu sẽ tải model nên mất thời gian. Không đóng sessi
 launch_demo(pipeline, share=True, debug=False)
 """
     ),
-    markdown("## 7. API Python trực tiếp, evaluation và export artifacts"),
+    markdown("## 10. API Python trực tiếp, evaluation và export artifacts"),
     code(
         """# report = pipeline.ingest(["/kaggle/input/my-data/file.pdf"])          # cộng dồn
 # report = pipeline.ingest([...], reset=True)                               # làm lại từ đầu

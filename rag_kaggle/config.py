@@ -23,6 +23,9 @@ class ParsingConfig:
     enable_ocr: bool = True
     ocr_model_name: str = "PaddleOCR-VL-1.6"
     ocr_model_dir: str | None = None
+    # Python of a separate venv with paddlepaddle-gpu + paddleocr (recommended on
+    # Kaggle). None runs PaddleOCR-VL inside the current process.
+    ocr_python: str | None = None
     ocr_batch_size: int = 1
     ocr_images_in_digital_docs: bool = True
     min_image_width: int = 220

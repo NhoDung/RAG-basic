@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +13,7 @@ from rag_kaggle.evaluation import answer_correct, hit_matches, retrieval_metrics
 from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
-from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter
+from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.parsers import classify_excel_region, rows_to_markdown
 from rag_kaggle.relationships import build_relationships
 from rag_kaggle.storage import MetadataStore, qdrant_point_id, tokenize_vi
@@ -256,6 +258,70 @@ class ComputationAndGuardrailTests(unittest.TestCase):
         self.assertEqual("text", classify_excel_region([["Báo cáo doanh thu"] * 5]))
         self.assertEqual("kpi", classify_excel_region([["Doanh thu", "Lợi nhuận"], ["1200", "300"]]))
         self.assertEqual("table", classify_excel_region([["A", "B"], ["x", "1"], ["y", "2"], ["z", "3"], ["w", "4"], ["v", "5"]]))
+
+
+FAKE_PADDLEOCR = '''
+import os
+class _Result:
+    def __init__(self, path):
+        self.json = {"res": {"parsing_res_list": [
+            {"block_label": "doc_title", "block_content": "BIỂU PHÍ"},
+            {"block_label": "text", "block_content": "Phí 499.000 VNĐ " + os.path.basename(path)}]}}
+class PaddleOCRVL:
+    def __init__(self, pipeline_version=None, **kwargs):
+        print("library noise on stdout")
+        if os.environ.get("FAKE_OCR_FAIL"):
+            raise OSError("model download failed")
+    def predict(self, path):
+        if "bad" in path:
+            raise ValueError("cannot read image")
+        return iter([_Result(path)])
+'''
+
+
+@unittest.skipIf(sys.platform.startswith("win"), "uses a POSIX shell wrapper")
+class OCRWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        for name, source in (("paddleocr", FAKE_PADDLEOCR), ("paddle", "__version__ = 'fake'\n")):
+            (root / name).mkdir()
+            (root / name / "__init__.py").write_text(source, encoding="utf-8")
+        (root / "paddle" / "__init__.py").write_text(
+            "__version__ = 'fake'\nclass device:\n    @staticmethod\n    def is_compiled_with_cuda():\n        return False\n",
+            encoding="utf-8",
+        )
+        self.python = root / "python"
+        self.python.write_text(f'#!/bin/sh\nPYTHONPATH="{root}" exec "{sys.executable}" "$@"\n', encoding="utf-8")
+        self.python.chmod(0o755)
+        self.log = root / "ocr.log"
+
+    def tearDown(self):
+        os.environ.pop("FAKE_OCR_FAIL", None)
+        self.tmp.cleanup()
+
+    def test_worker_round_trip_and_errors(self):
+        adapter = PaddleOCRVLAdapter("PaddleOCR-VL-1.6", python_executable=str(self.python), log_path=self.log)
+        result = adapter.predict("/data/page_0001.png")
+        self.assertEqual(["doc_title", "text"], [block["label"] for block in result["blocks"]])
+        self.assertIn("499.000", result["text"])
+        with self.assertRaises(RuntimeError):
+            adapter.predict("/data/bad.png")
+        self.assertIn("page_2.png", adapter.predict("/data/page_2.png")["text"])  # worker survives
+        adapter.unload()
+        self.assertIsNone(adapter._worker)
+        self.assertIn("library noise", self.log.read_text(encoding="utf-8"))
+
+    def test_failed_load_is_not_retried(self):
+        os.environ["FAKE_OCR_FAIL"] = "1"
+        adapter = PaddleOCRVLAdapter("PaddleOCR-VL-1.6", python_executable=str(self.python), log_path=self.log)
+        with self.assertRaises(RuntimeError):
+            adapter.predict("/data/page.png")
+        with self.assertRaises(RuntimeError):
+            adapter.predict("/data/page.png")
+        # One worker spawn with two constructor attempts (pipeline_version, then default).
+        self.assertEqual(2, self.log.read_text(encoding="utf-8").count("library noise"))
+        self.assertEqual("v1.6", pipeline_version_for("PaddleOCR-VL-1.6"))
 
 
 class FakeSentenceModel:

@@ -18,10 +18,15 @@ PDF / DOCX / Excel
 ## Chạy trên Kaggle
 
 1. Upload [`notebooks/kaggle_full_pipeline.ipynb`](notebooks/kaggle_full_pipeline.ipynb) lên Kaggle.
-2. Chọn GPU T4/P100 và bật Internet.
-3. Chạy lần lượt các cell.
-4. Trong Gradio, upload tài liệu ở tab `Ingestion`, sau đó hỏi ở tab `Chat`.
-5. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc. Lần sau có thể khôi phục bằng
+2. Chọn GPU **T4** và bật Internet. Không dùng P100: PaddleOCR-VL cần compute capability ≥ 7.0.
+3. Chạy lần lượt các cell. PaddleOCR-VL được cài vào venv riêng (`/tmp/paddle_env`) với
+   `paddlepaddle-gpu` 3.x từ index chính thức của Paddle và được gọi qua subprocess, nên không
+   xung đột CUDA/cuDNN với PyTorch.
+4. Cell **Smoke test** chạy toàn bộ pipeline trên tài liệu mẫu và in PASS/WARN/FAIL cho từng stage.
+   Nếu có FAIL, xem `detail` của bước đó (log OCR worker ở `rag_smoke/logs/ocr_worker.log` khi
+   chạy `run_smoke_test(config, keep=True)`).
+5. Trong Gradio, upload tài liệu ở tab `Ingestion`, sau đó hỏi ở tab `Chat`.
+6. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc. Lần sau có thể khôi phục bằng
    `pipeline.restore_artifacts(...)` hoặc tab `System`.
 
 Notebook tự clone repository này. Vì vậy cần push phiên bản source code mới nhất lên
@@ -53,7 +58,7 @@ rag_kaggle/
 ├── models.py           # Canonical Document Model: Document, Block, Relationship, Chunk
 ├── ingestion.py        # Validate file (định dạng, kích thước, mật khẩu, macro), LibreOffice
 ├── parsers.py          # PDF (heading theo font, bảng, scan), DOCX, Excel (KPI, chart, merged cells)
-├── paddleocr_vl.py     # PaddleOCR-VL adapter: text + layout blocks + raw output
+├── paddleocr_vl.py     # PaddleOCR-VL adapter (in-process hoặc worker ở venv riêng)
 ├── vision.py           # Qwen2.5-VL cho flowchart/chart (JSON, retry, needs_review)
 ├── relationships.py    # Document graph (§5.3)
 ├── chunking.py         # Parent–Child chunking theo modality
@@ -65,6 +70,7 @@ rag_kaggle/
 ├── tracing.py          # trace_id + JSONL log theo stage
 ├── evaluation.py       # Recall@k, MRR, correctness, citation/refusal accuracy
 ├── pipeline.py         # End-to-end orchestration, manifest, export/restore artifacts
+├── smoke.py            # Smoke test toàn pipeline trên GPU Kaggle với tài liệu mẫu
 └── ui.py               # Gradio: Ingestion, Chat, Evaluation, System
 ```
 
