@@ -128,6 +128,9 @@ class ChildChunk:
             "sheet_name": self.sheet_name,
             "cell_range": self.cell_range,
             "asset_path": self.asset_path,
+            "original_file_name": self.metadata.get("original_file_name", self.source_file),
+            "uploaded_at": self.metadata.get("uploaded_at"),
+            "content_hash": self.metadata.get("content_hash"),
         }
 
 

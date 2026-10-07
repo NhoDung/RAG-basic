@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import logging
 import shutil
+import threading
 import time
 import uuid
 import zipfile
@@ -28,12 +29,16 @@ from .relationships import build_relationships
 from .retrieval import HybridRetriever, Reranker
 from .storage import DenseEncoder, HybridIndex, MetadataStore
 from .tracing import Trace
-from .utils import file_sha256, stable_id
+from .utils import file_sha256
 from .vision import VisionReasoner
 
 
 LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[str], None]
+
+
+class IngestionInProgressError(RuntimeError):
+    """Raised instead of queueing a second expensive ingestion run."""
 
 
 class RAGPipeline:
@@ -52,6 +57,8 @@ class RAGPipeline:
         self.chunker = ParentChildChunker(self.config.chunking)
         self.reranker = Reranker(self.config)
         self.generator = LocalQwen(self.config)
+        # SQLite/Qdrant are mutable shared state; ingestion must be exclusive.
+        self._ingestion_lock = threading.Lock()
         self._open_stores()
 
     def _open_stores(self) -> None:
@@ -68,10 +75,25 @@ class RAGPipeline:
         reset: bool = False,
         progress: ProgressCallback | None = None,
     ) -> dict:
+        if not self._ingestion_lock.acquire(blocking=False):
+            raise IngestionInProgressError(
+                "An ingestion run is already in progress. Wait for it to finish before uploading another batch."
+            )
+        try:
+            return self._ingest(files, reset=reset, progress=progress)
+        finally:
+            self._ingestion_lock.release()
+
+    def _ingest(
+        self,
+        files: list[str | Path],
+        reset: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> dict:
         """Ingestion mode (§12): parse -> OCR/VLM -> chunk -> embed -> index -> manifest.
 
-        ``reset=False`` (default) adds to the existing index; unchanged files are
-        skipped and a new version of a file replaces its previous version.
+        ``reset=False`` adds to the existing index. Identical re-uploads are
+        skipped; different contents with the same name are kept as versions.
         """
         paths = [Path(path) for path in files]
         if not paths:
@@ -79,6 +101,7 @@ class RAGPipeline:
         run_id = uuid.uuid4().hex[:12]
         notify = progress or (lambda message: None)
         report: dict[str, Any] = {"run_id": run_id, "documents": [], "skipped": [], "errors": [], "statuses": []}
+        notify(f"Starting ingestion: {len(paths)} file(s).")
 
         def record(stage, status, source=None, document_id=None, error_code=None, message=None, retryable=False, started=None):
             item = StageStatus(
@@ -104,31 +127,34 @@ class RAGPipeline:
             self.reranker.unload()
 
         new_chunks = []
-        removed_ids: list[str] = []
-        for source in paths:
+        for file_index, source in enumerate(paths, start=1):
             name = source.name
             started = time.perf_counter()
             try:
                 facts = validate_file(source, self.config)
-                stored_source = self._copy_source(source)
-                document_id = stable_id(name, file_sha256(stored_source))
+                content_hash = file_sha256(source)
+                existing = self.metadata.document_by_original_and_hash(name, content_hash)
                 if (
                     not reset
                     and self.config.ingestion.skip_unchanged_documents
-                    and self.metadata.get_document(document_id) is not None
+                    and existing is not None
                 ):
-                    report["skipped"].append({"file": name, "document_id": document_id, "reason": "unchanged"})
-                    record("parse", "skipped", name, document_id, message="unchanged file already indexed")
+                    report["skipped"].append({"file": name, "document_id": existing["document_id"], "reason": "unchanged"})
+                    record("parse", "skipped", name, existing["document_id"], message="unchanged file already indexed")
                     continue
-                for previous in self.metadata.documents_by_source(name):
-                    if previous["document_id"] != document_id:
-                        self.metadata.delete_document(previous["document_id"])
-                        removed_ids.append(previous["document_id"])
-                        notify(f"Thay thế phiên bản cũ của {name}")
-
-                notify(f"Parsing {name}...")
-                document = self.parser.parse(stored_source)
-                document.metadata.update({"validation": facts})
+                # Existing versions with the same original filename are retained.
+                uploaded_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+                stored_source = self._copy_source(source, content_hash)
+                notify(f"[{file_index}/{len(paths)}] Parsing {name}...")
+                document = self.parser.parse(stored_source, display_name=name, progress=notify)
+                document.metadata.update(
+                    {
+                        "validation": facts,
+                        "original_file_name": name,
+                        "uploaded_at": uploaded_at,
+                        "stored_source": str(stored_source),
+                    }
+                )
                 warnings = document.metadata.get("warnings", [])
                 record(
                     "parse",
@@ -146,6 +172,15 @@ class RAGPipeline:
                 stage_started = time.perf_counter()
                 build_relationships(document)
                 parents, chunks = self.chunker.chunk(document)
+                version_metadata = {
+                    "original_file_name": name,
+                    "uploaded_at": uploaded_at,
+                    "content_hash": content_hash,
+                }
+                for parent in parents:
+                    parent.metadata.update(version_metadata)
+                for chunk in chunks:
+                    chunk.metadata.update(version_metadata)
                 if self.config.parsing.write_table_parquet:
                     save_table_parquet(document, self.config.table_dir)
                 save_parsed_document(document, self.config.parsed_dir)
@@ -178,11 +213,11 @@ class RAGPipeline:
         self.ocr.unload()
         self.vision.unload()
 
-        if new_chunks or removed_ids or reset:
+        if new_chunks or reset:
             started = time.perf_counter()
             notify(f"Embedding + indexing {len(new_chunks)} chunks...")
             try:
-                self.index.build(new_chunks, reset=reset, removed_document_ids=removed_ids)
+                self.index.build(new_chunks, reset=reset, progress=notify)
                 record("index", "success", message=f"{len(new_chunks)} chunks upserted", started=started)
             except Exception as exc:
                 LOGGER.exception("Indexing failed")
@@ -399,8 +434,10 @@ class RAGPipeline:
         pipeline.restore_artifacts(archive)
         return pipeline
 
-    def _copy_source(self, source: Path) -> Path:
-        target = self.config.source_dir / source.name
+    def _copy_source(self, source: Path, content_hash: str | None = None) -> Path:
+        """Keep every content version without overwriting a same-named upload."""
+        digest = content_hash or file_sha256(source)
+        target = self.config.source_dir / f"{source.stem}__{digest[:12]}{source.suffix.lower()}"
         if source.resolve() != target.resolve():
             shutil.copy2(source, target)
         return target

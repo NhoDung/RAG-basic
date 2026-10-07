@@ -6,27 +6,72 @@ import threading
 from pathlib import Path
 
 from .pipeline import RAGPipeline
+from .utils import file_sha256
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+
+class UploadIngestionGate:
+    """Claims an upload once, so repeated Gradio events never create re-ingest work."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = False
+        self._claimed: set[str] = set()
+
+    @staticmethod
+    def _key(path: str) -> str:
+        source = Path(path)
+        return f"{source.name}:{file_sha256(source)}"
+
+    def begin(self, paths: list[str], reset: bool) -> tuple[list[str], list[str], list[str]]:
+        keys = [(path, self._key(path)) for path in paths]
+        with self._lock:
+            if self._active:
+                return [], [], ["Một ingestion đang chạy; lượt upload này không được đưa vào hàng đợi."]
+            if reset:
+                self._claimed.clear()
+            accepted = [(path, key) for path, key in keys if reset or key not in self._claimed]
+            duplicates = [Path(path).name for path, key in keys if not reset and key in self._claimed]
+            if not accepted:
+                return [], duplicates, []
+            self._active = True
+            self._claimed.update(key for _, key in accepted)
+            return [path for path, _ in accepted], duplicates, []
+
+    def finish(self, paths: list[str], succeeded: bool) -> None:
+        with self._lock:
+            self._active = False
+            if not succeeded:
+                self._claimed.difference_update(self._key(path) for path in paths)
 HIT_HEADERS = ["#", "file", "type", "page/sheet", "dense", "bm25", "RRF", "rerank", "preview"]
 ALL = "(tất cả)"
 
 
 def build_demo(pipeline: RAGPipeline):
     import gradio as gr
+    upload_gate = UploadIngestionGate()
 
     def ingest_files(files, reset):
         if not files:
             yield "Chưa có file.", "", None, _documents(pipeline)
             return
         paths = [file.name if hasattr(file, "name") else str(file) for file in files]
+        accepted_paths, duplicates, gate_errors = upload_gate.begin(paths, reset)
+        if gate_errors:
+            yield "\n".join(gate_errors), "", None, _documents(pipeline)
+            return
+        if not accepted_paths:
+            message = "Các file giống hệt đã được parse hoặc đã được nhận xử lý: " + ", ".join(duplicates)
+            yield message, "", None, _documents(pipeline)
+            return
         messages: queue.Queue = queue.Queue()
         outcome: dict = {}
 
         def worker():
             try:
-                outcome["report"] = pipeline.ingest(paths, reset=reset, progress=messages.put)
+                outcome["report"] = pipeline.ingest(accepted_paths, reset=reset, progress=messages.put)
                 outcome["archive"] = str(pipeline.export_artifacts())
             except Exception as exc:  # Reported in the UI instead of crashing the demo.
                 outcome["error"] = str(exc)
@@ -35,6 +80,8 @@ def build_demo(pipeline: RAGPipeline):
 
         threading.Thread(target=worker, daemon=True).start()
         log_lines = []
+        if duplicates:
+            log_lines.append("Bỏ qua file upload trùng: " + ", ".join(duplicates))
         while True:
             message = messages.get()
             if message is None:
@@ -42,9 +89,11 @@ def build_demo(pipeline: RAGPipeline):
             log_lines.append(message)
             yield "\n".join(log_lines), "", None, _documents(pipeline)
         if "error" in outcome:
+            upload_gate.finish(accepted_paths, succeeded=False)
             log_lines.append(f"Ingestion failed: {outcome['error']}")
             yield "\n".join(log_lines), "", None, _documents(pipeline)
             return
+        upload_gate.finish(accepted_paths, succeeded=outcome["report"].get("ok", False))
         report = {key: value for key, value in outcome["report"].items() if key != "statuses"}
         yield (
             "\n".join(log_lines),
@@ -180,9 +229,13 @@ def build_demo(pipeline: RAGPipeline):
             restore_file = gr.File(label="Khôi phục từ rag_artifacts.zip", file_types=[".zip"], type="filepath")
             restore_button = gr.Button("Khôi phục artifacts")
 
-        ingest_button.click(
-            ingest_files, inputs=[files, reset], outputs=[stage_log, ingest_report, artifact, documents]
-        ).then(filter_choices, outputs=[source_filter, type_filter])
+        ingest_outputs = [stage_log, ingest_report, artifact, documents]
+        files.change(ingest_files, inputs=[files, reset], outputs=ingest_outputs).then(
+            filter_choices, outputs=[source_filter, type_filter]
+        )
+        ingest_button.click(ingest_files, inputs=[files, reset], outputs=ingest_outputs).then(
+            filter_choices, outputs=[source_filter, type_filter]
+        )
         chat_outputs = [chatbot, question, hits_table, gallery, trace_view, contexts_view]
         chat_inputs = [question, chatbot, source_filter, type_filter]
         ask_button.click(respond, inputs=chat_inputs, outputs=chat_outputs)

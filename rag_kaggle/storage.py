@@ -9,7 +9,7 @@ import sqlite3
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import PipelineConfig
 from .models import Block, ChildChunk, ParentContext, ParsedDocument, Relationship, StageStatus
@@ -235,6 +235,17 @@ class MetadataStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def document_by_original_and_hash(self, original_file_name: str, content_hash: str) -> dict | None:
+        """Find an already indexed upload independently of its stored filename."""
+        row = self.connection.execute(
+            """SELECT document_id FROM documents
+               WHERE content_hash = ?
+                 AND json_extract(payload_json, '$.metadata.original_file_name') = ?
+               LIMIT 1""",
+            (content_hash, original_file_name),
+        ).fetchone()
+        return dict(row) if row else None
+
     def list_documents(self) -> list[dict]:
         rows = self.connection.execute(
             "SELECT document_id, source_file, file_type, content_hash FROM documents ORDER BY source_file"
@@ -445,8 +456,15 @@ class HybridIndex:
             self.client = QdrantClient(path=str(self.config.qdrant_dir))
         self._load_bm25()
 
-    def build(self, chunks: list[ChildChunk], reset: bool = True, removed_document_ids: list[str] | None = None):
+    def build(
+        self,
+        chunks: list[ChildChunk],
+        reset: bool = True,
+        removed_document_ids: list[str] | None = None,
+        progress: Callable[[str], None] | None = None,
+    ):
         """Upsert ``chunks`` (idempotent IDs) and rebuild BM25 over the full corpus."""
+        notify = progress or (lambda _message: None)
         self.open()
         from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -459,7 +477,9 @@ class HybridIndex:
             self.delete_document(document_id)
 
         if chunks:
+            notify(f"Dense embedding {len(chunks)} chunk(s) on {self.config.retrieval.dense_device}.")
             vectors = self.encoder.encode([chunk.content for chunk in chunks], show_progress=True)
+            notify("Dense embedding complete; writing vectors to Qdrant.")
             model_name = self.encoder.model_name
             if indexed_model and indexed_model != model_name:
                 raise RuntimeError(
@@ -473,7 +493,8 @@ class HybridIndex:
                     vectors_config={DENSE_VECTOR_NAME: VectorParams(size=dimension, distance=Distance.COSINE)},
                 )
                 self._create_payload_indexes()
-            for start in range(0, len(chunks), 64):
+            total_batches = (len(chunks) + 63) // 64
+            for batch_number, start in enumerate(range(0, len(chunks), 64), start=1):
                 points = [
                     PointStruct(
                         id=qdrant_point_id(chunk.chunk_id),
@@ -483,9 +504,11 @@ class HybridIndex:
                     for chunk, vector in zip(chunks[start : start + 64], vectors[start : start + 64])
                 ]
                 self.client.upsert(self.config.collection_name, points=points, wait=True)
+                notify(f"Qdrant upsert batch {batch_number}/{total_batches}.")
             self.metadata.set_setting("index.dense_model", model_name)
             self.metadata.set_setting("index.dimension", dimension)
 
+        notify("Rebuilding BM25 index over the full corpus.")
         self._build_bm25(self.metadata.list_chunks())
 
     def delete_document(self, document_id: str) -> None:

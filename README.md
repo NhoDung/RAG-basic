@@ -27,7 +27,8 @@ PDF / DOCX / Excel
 4. Cell **Smoke test** chạy toàn bộ pipeline trên tài liệu mẫu và in PASS/WARN/FAIL cho từng stage.
    Nếu có FAIL, xem `detail` của bước đó (log OCR worker ở `rag_smoke/logs/ocr_worker.log` khi
    chạy `run_smoke_test(config, keep=True)`).
-5. Trong Gradio, upload tài liệu ở tab `Ingestion`, sau đó hỏi ở tab `Chat`.
+5. Trong Gradio, upload tài liệu ở tab `Ingestion`; parse/index tự chạy một lần. Theo dõi log tiến độ,
+   sau đó hỏi ở tab `Chat`.
 6. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc. Lần sau có thể khôi phục bằng
    `pipeline.restore_artifacts(...)` hoặc tab `System`.
 
@@ -99,6 +100,17 @@ python -m unittest discover -s tests
 ```
 
 Test end-to-end dùng encoder giả lập và LLM giả lập nên không cần GPU.
+
+## Ingestion UX
+
+Trong Gradio, chọn file là bắt đầu parse/index tự động. Nhấn nút parse thêm lần nữa
+cho cùng một bản upload sẽ bị từ chối, và pipeline cũng khóa để không có hai ingestion
+chạy đồng thời. Log hiển thị tiến độ PDF theo trang, DOCX theo block, Excel theo sheet,
+sau đó đến embedding, Qdrant, và BM25.
+
+File có cùng tên nhưng nội dung khác nhau được lưu thành các document version riêng.
+Mỗi version có `original_file_name`, `uploaded_at`, và `content_hash` trong SQLite và
+Qdrant payload; file nguồn nội bộ dùng hậu tố hash để không bị ghi đè.
 
 ## T4 x2
 

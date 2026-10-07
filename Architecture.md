@@ -2,6 +2,22 @@
 
 ## 1. Tổng quan
 
+### 1.0. Trạng thái implementation hiện tại
+
+Repository hiện chạy một notebook Kaggle duy nhất (`notebooks/kaggle_full_pipeline.ipynb`) và package
+`rag_kaggle/`; đây là nguồn đúng hơn cho các chi tiết triển khai so với cấu trúc tham khảo ở §17.
+
+- Qdrant chạy embedded/local trong `/kaggle/working/rag_runtime`; BM25 là index local `bm25.pkl`.
+- Dense model thực tế mặc định là `BAAI/bge-m3` (không phải `bge-multilingual-gemma2` ở baseline thiết kế),
+  để cùng tồn tại với Qwen 7B trên T4; xem `configs/baseline.yaml`.
+- Gradio tự bắt đầu ingest khi người dùng upload. `RAGPipeline.ingest()` có mutex, vì vậy chỉ một
+  parse/index được chạy; upload lặp trong UI bị từ chối thay vì trở thành queue chờ.
+- File có cùng tên nhưng nội dung khác nhau được giữ là các version riêng. Một bản upload được nhận diện
+  bằng `(original_file_name, content_hash)`; file gốc trong runtime dùng hậu tố hash để không ghi đè.
+- Tiến độ được gửi về UI theo PDF page, DOCX block, Excel sheet, dense embedding, Qdrant batch và BM25.
+- Mỗi document/chunk version mang `original_file_name`, `uploaded_at`, `content_hash`; các trường này
+  được lưu ở SQLite và được copy vào Qdrant payload để audit/lọc về sau.
+
 Hệ thống xây dựng đầy đủ pipeline:
 
 ```text
@@ -247,8 +263,10 @@ sequenceDiagram
     participant Store as Qdrant + structured storage
 
     User->>UI: Upload PDF, DOCX hoặc Excel
+    UI->>UI: Claim upload batch, từ chối batch trùng/đang chạy
     UI->>Router: File + metadata
-    Router->>Router: Validate MIME, hash, deduplicate
+    Router->>Router: Validate MIME, hash, deduplicate theo tên gốc + hash
+    Router->>Router: Gán uploaded_at, giữ version khác hash
     Router->>Parser: Chọn parser theo định dạng
     Parser->>Parser: Trích xuất text, table, image và chart
 
@@ -269,7 +287,7 @@ sequenceDiagram
     Chunker->>Encoder: Child contents
     Encoder->>Encoder: Dense vectors + BM25 sparse vectors
     Encoder->>Store: Batch upsert Qdrant
-    Store-->>UI: Manifest và trạng thái ingestion
+    Store-->>UI: Manifest và trạng thái ingestion/progress
     UI-->>User: Số document/block/chunk và lỗi nếu có
 ```
 
@@ -444,11 +462,15 @@ rộng sang parent và các block có quan hệ.
 File router thực hiện:
 
 1. Kiểm tra MIME type và phần mở rộng.
-2. Tính SHA-256 để nhận biết file trùng hoặc phiên bản mới.
-3. Gán `document_id` ổn định.
-4. Lưu file gốc vào thư mục asset.
-5. Chọn parser theo định dạng.
-6. Ghi trạng thái ingestion để có thể chạy lại từ bước bị lỗi.
+2. Tính SHA-256 và kiểm tra `(original_file_name, content_hash)` trước khi parse. Bản giống hệt đã index
+   được skip; UI cũng từ chối click/upload lặp trước khi gọi pipeline.
+3. Giữ các file trùng tên nhưng hash khác nhau như document version riêng; không xóa version cũ.
+4. Gán `document_id` ổn định theo source copy có hậu tố hash, rồi lưu `original_file_name`, `uploaded_at`,
+   `content_hash` trong metadata.
+5. Lưu file gốc vào `source/<stem>__<hash-prefix>.<ext>` để không ghi đè upload khác version.
+6. Chọn parser theo định dạng.
+7. Ghi trạng thái ingestion để có thể chạy lại từ bước bị lỗi.
+8. Giữ mutex ở `RAGPipeline.ingest()`; nếu đã có ingestion chạy, request mới bị từ chối thay vì chờ queue.
 
 Định dạng baseline:
 
@@ -616,6 +638,11 @@ Mọi parser phải trả về cùng một mô hình trung gian.
   "file_type": "xlsx",
   "language": ["vi", "en"],
   "content_hash": "...",
+  "metadata": {
+    "original_file_name": "bao_cao_2025.xlsx",
+    "uploaded_at": "2026-10-07T10:15:30+00:00",
+    "stored_source": "source/bao_cao_2025__a1b2c3d4e5f6.xlsx"
+  },
   "parser_version": "...",
   "created_at": "...",
   "blocks": [],
@@ -741,6 +768,11 @@ và phạm vi cell. Không biến mỗi cell thành một vector riêng.
   "cell_range": "A4:E19",
   "asset_path": null,
   "token_count": 412,
+  "metadata": {
+    "original_file_name": "bao_cao_2025.xlsx",
+    "uploaded_at": "2026-10-07T10:15:30+00:00",
+    "content_hash": "..."
+  },
   "parser_version": "...",
   "chunker_version": "..."
 }
@@ -785,6 +817,9 @@ Các field cần tạo payload index tùy corpus:
 - `document_id`
 - `chunk_type`
 - `source_file`
+- `original_file_name`
+- `uploaded_at`
+- `content_hash`
 - `sheet_name`
 - `section_path`
 
@@ -1043,8 +1078,10 @@ riêng và version được pin.
 
 Gradio UI tối thiểu gồm:
 
-- Upload/chọn corpus.
-- Nút chạy ingestion và trạng thái từng stage.
+- Upload/chọn corpus; upload sẽ tự chạy ingestion đúng một lần.
+- Log streaming theo stage: file/batch, PDF page, DOCX block, Excel sheet, embedding, Qdrant và BM25.
+- Nút chạy lại chỉ để retry/reset có chủ đích; cùng bản upload không được xếp thêm queue.
+- Trạng thái từng stage và thông báo file trùng/bản version.
 - Chat input.
 - Answer và citations.
 - Retrieved child chunks.

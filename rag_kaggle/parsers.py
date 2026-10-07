@@ -6,7 +6,7 @@ import logging
 import re
 import zipfile
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from xml.etree import ElementTree
 
 from .config import PARSER_VERSION, PipelineConfig
@@ -69,25 +69,39 @@ class DocumentParser:
         self.config = config
         self.ocr = ocr
         self.vision = vision
+        self._progress: Callable[[str], None] | None = None
 
-    def parse(self, path: str | Path, display_name: str | None = None) -> ParsedDocument:
+    def parse(
+        self,
+        path: str | Path,
+        display_name: str | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> ParsedDocument:
         source = Path(path)
         extension = source.suffix.lower()
-        if extension == ".pdf":
-            document = self._parse_pdf(source)
-        elif extension == ".docx":
-            document = self._parse_docx(source)
-        elif extension in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-            document = self._parse_excel(source)
-        elif extension == ".xls":
-            document = self._parse_legacy_excel(source)
-        else:
-            raise IngestionError("unsupported_type", f"Unsupported file type: {extension}")
+        previous_progress, self._progress = self._progress, progress
+        try:
+            if extension == ".pdf":
+                document = self._parse_pdf(source)
+            elif extension == ".docx":
+                document = self._parse_docx(source)
+            elif extension in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+                document = self._parse_excel(source)
+            elif extension == ".xls":
+                document = self._parse_legacy_excel(source)
+            else:
+                raise IngestionError("unsupported_type", f"Unsupported file type: {extension}")
+        finally:
+            self._progress = previous_progress
         if display_name:
             document.source_file = display_name
             for block in document.blocks:
                 block.source_file = display_name
         return document
+
+    def _notify(self, message: str) -> None:
+        if self._progress is not None:
+            self._progress(message)
 
     # ------------------------------------------------------------------ common
 
@@ -241,12 +255,15 @@ class DocumentParser:
             page_text = clean_text(page.get_text("text"))
             if len(page_text) < self.config.parsing.scan_text_threshold:
                 if self.config.parsing.enable_ocr:
+                    self._notify(f"PDF page {page_number}/{pdf.page_count}: rendering and PaddleOCR-VL.")
                     sections = self._parse_scanned_page(document, page, page_number, asset_dir, sections)
                 elif page_text:
+                    self._notify(f"PDF page {page_number}/{pdf.page_count}: short text, OCR disabled.")
                     document.add_block(
                         self._block(document, "text", page_text, f"page-{page_number}-raw", page=page_number)
                     )
                 continue
+            self._notify(f"PDF page {page_number}/{pdf.page_count}: extracting text, tables, and images.")
             sections = self._parse_digital_page(
                 document, pdf, page, page_number, asset_dir, sections, body_size, heading_levels
             )
@@ -453,7 +470,12 @@ class DocumentParser:
                     target.append(text)
         document.metadata.update({"headers": headers, "footers": footers})
 
-        for ordinal, item in enumerate(iter_docx_blocks(docx), start=1):
+        body_items = list(iter_docx_blocks(docx))
+        total_items = len(body_items)
+        self._notify(f"DOCX: reading {total_items} body block(s), headers, tables, charts, and images.")
+        for ordinal, item in enumerate(body_items, start=1):
+            if ordinal == 1 or ordinal == total_items or ordinal % 10 == 0:
+                self._notify(f"DOCX block {ordinal}/{total_items}.")
             if isinstance(item, Paragraph):
                 text = clean_text(item.text)
                 style_name = item.style.name if item.style is not None else ""
@@ -485,7 +507,9 @@ class DocumentParser:
             elif isinstance(item, Table):
                 self._add_docx_table(document, item, f"docx-{ordinal}", sections)
 
+        self._notify("DOCX: extracting media not anchored in the body flow.")
         self._extract_unreferenced_media(document, source, asset_dir, sections, seen_parts)
+        self._notify("DOCX: extracting embedded workbooks.")
         self._extract_docx_embedded_workbooks(document, source)
         return document
 
@@ -611,7 +635,10 @@ class DocumentParser:
         hidden_sheets, missing_cached = [], 0
         sheet_regions: dict[str, list[tuple[Block, tuple[int, int, int, int]]]] = {}
 
+        total_sheets = len(formulas.worksheets)
+        self._notify(f"Excel: reading {total_sheets} worksheet(s), cells, merged ranges, and formulas.")
         for sheet_index, formula_sheet in enumerate(formulas.worksheets):
+            self._notify(f"Excel sheet {sheet_index + 1}/{total_sheets}: {formula_sheet.title}.")
             if formula_sheet.sheet_state != "visible":
                 hidden_sheets.append(formula_sheet.title)
                 if not self.config.parsing.include_hidden_sheets:
@@ -667,6 +694,7 @@ class DocumentParser:
             if hidden["rows"] or hidden["columns"]:
                 document.metadata.setdefault("hidden_ranges", {})[formula_sheet.title] = hidden
 
+        self._notify("Excel: extracting charts and embedded images.")
         for sheet_index, formula_sheet in enumerate(formulas.worksheets):
             if formula_sheet.title in hidden_sheets and not self.config.parsing.include_hidden_sheets:
                 continue

@@ -18,6 +18,7 @@ from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.parsers import classify_excel_region, rows_to_markdown
 from rag_kaggle.relationships import build_relationships
 from rag_kaggle.storage import MetadataStore, qdrant_point_id, tokenize_vi
+from rag_kaggle.ui import UploadIngestionGate
 from rag_kaggle.utils import html_table_to_rows, parse_cell_range, parse_number
 from rag_kaggle.vision import classify_image, parse_json_object, render_vlm_output
 
@@ -33,6 +34,38 @@ def make_block(block_id, block_type, content, order, **kwargs):
 
 
 class CorePipelineTests(unittest.TestCase):
+    def test_upload_gate_rejects_repeated_upload_and_parallel_batch(self):
+        path = "report.pdf"
+        gate = UploadIngestionGate()
+        gate._key = lambda value: f"hash:{value}"  # Avoid a real Gradio temp upload in this unit test.
+        accepted, duplicates, errors = gate.begin([path], reset=False)
+        self.assertEqual([path], accepted)
+        self.assertFalse(duplicates)
+        self.assertFalse(errors)
+        accepted, duplicates, errors = gate.begin([path], reset=False)
+        self.assertFalse(accepted)
+        self.assertFalse(duplicates)
+        self.assertTrue(errors)
+        gate.finish([path], succeeded=True)
+        accepted, duplicates, errors = gate.begin([path], reset=False)
+        self.assertFalse(accepted)
+        self.assertEqual(["report.pdf"], duplicates)
+        self.assertFalse(errors)
+
+    def test_metadata_finds_identical_original_upload(self):
+        store = MetadataStore(Path(":memory:"))
+        try:
+            document = ParsedDocument("doc-v1", "report.pdf", "pdf", "content-hash")
+            document.metadata = {"original_file_name": "report.pdf", "uploaded_at": "2026-10-07T00:00:00+00:00"}
+            store.upsert_document(document, [], [])
+            self.assertEqual(
+                {"document_id": "doc-v1"},
+                store.document_by_original_and_hash("report.pdf", "content-hash"),
+            )
+            self.assertIsNone(store.document_by_original_and_hash("other.pdf", "content-hash"))
+        finally:
+            store.close()
+
     def test_parent_child_chunking(self):
         config = PipelineConfig()
         document = ParsedDocument("doc1", "sample.xlsx", "xlsx", "hash")
@@ -492,7 +525,7 @@ class EndToEndTests(unittest.TestCase):
         evaluation = self.pipeline.evaluate(dataset, run_answers=False)
         self.assertEqual(1.0, evaluation["retrieval"]["recall@5"])
 
-    def test_new_version_replaces_old_and_bad_file_is_reported(self):
+    def test_new_version_is_retained_and_bad_file_is_reported(self):
         path = self._docx()
         self.pipeline.ingest([path])
         from docx import Document
@@ -503,8 +536,14 @@ class EndToEndTests(unittest.TestCase):
         bad = self.inputs / "broken.docx"
         bad.write_bytes(b"not a zip")
         report = self.pipeline.ingest([path, bad])
-        self.assertEqual(1, self.pipeline.metadata.stats()["documents"])
+        self.assertEqual(2, self.pipeline.metadata.stats()["documents"])
         self.assertEqual("invalid_signature", report["errors"][0]["error_code"])
+        repeated = self.pipeline.ingest([path])
+        self.assertEqual(1, len(repeated["skipped"]))
+        versions = self.pipeline.metadata.connection.execute(
+            "SELECT payload_json FROM documents ORDER BY document_id"
+        ).fetchall()
+        self.assertTrue(all(json.loads(row[0])["metadata"]["uploaded_at"] for row in versions))
         statuses = self.pipeline.metadata.statuses(report["run_id"])
         self.assertIn("failed", {status["status"] for status in statuses})
 

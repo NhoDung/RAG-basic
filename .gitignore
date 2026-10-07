@@ -12,3 +12,5 @@ rag_artifacts.zip
 # Local environments and secrets
 .venv/
 .env
+
+raw-data/

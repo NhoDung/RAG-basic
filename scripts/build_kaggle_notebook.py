@@ -241,8 +241,8 @@ if ARTIFACTS:
     markdown(
         """## 9. Chạy Gradio
 
-- **Ingestion**: upload PDF/DOCX/XLSX rồi bấm **Parse và lập chỉ mục**. Mặc định index được cộng dồn;
-  tick "Xoá toàn bộ index cũ" để làm lại từ đầu. File không đổi sẽ được bỏ qua.
+- **Ingestion**: chọn PDF/DOCX/XLSX là hệ thống tự parse và lập chỉ mục đúng một lần. Nhấn lại với cùng file sẽ bị từ chối; các file khác nội dung nhưng trùng tên được giữ thành version riêng.
+- **Tiến độ**: xem log theo trang PDF, block DOCX, sheet Excel, rồi embedding/Qdrant/BM25. Chỉ một ingestion được phép chạy tại một thời điểm.
 - **Chat**: hỏi đáp, xem citation, retrieved chunks, điểm dense/BM25/RRF/rerank, preview ảnh nguồn và trace.
 - **Evaluation**: upload dataset JSONL (xem `evaluation/dataset.sample.jsonl`).
 - **System**: thống kê, trạng thái từng stage, khôi phục artifacts.
