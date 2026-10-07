@@ -12,7 +12,7 @@ parsing:
   enable_ocr: true
   ocr_model_name: PaddleOCR-VL-1.6
   ocr_model_dir: null          # Kaggle Dataset path when running offline
-  ocr_cuda_visible_devices: null # Notebook tự chọn GPU 0 khi T4 x2
+  ocr_cuda_visible_devices: null # Notebook tự chọn GPU 1 khi T4 x2
   ocr_images_in_digital_docs: true
   include_hidden_sheets: false
   include_hidden_rows_columns: false
@@ -46,7 +46,7 @@ retrieval:
   rerank_top_k: 8
   reranker_enabled: true
   reranker_model: BAAI/bge-reranker-v2-m3
-  reranker_device: cuda          # Notebook đổi thành cuda:1 khi T4 x2
+  reranker_device: cuda          # Notebook đổi thành CPU khi T4 x2
   expand_relationships: true
 
 generation:

@@ -109,6 +109,11 @@ quan hệ tài liệu và file nguồn.
 
 ![Vòng đời model trên GPU Kaggle](./docs/diagrams/06-kaggle-gpu-lifecycle.png)
 
+Preset T4 x2 dành GPU 0 cho Qwen answer/Qwen-VL, còn GPU 1 được dùng tuần tự cho
+PaddleOCR-VL rồi BGE-M3. Reranker chạy FP32 trên CPU vì chỉ chấm lại khoảng 20-30
+candidates; BM25, Qdrant local, parsing, chunking và structured computation cũng
+dùng CPU/RAM. OCR worker phải kết thúc trước khi dense embedding bắt đầu.
+
 Các ảnh PNG được sinh bởi `scripts/render_architecture_diagrams.py`. Sau khi chỉnh
 nội dung hoặc style trong script, chạy lại:
 
@@ -398,31 +403,26 @@ child trúng query, block được tham chiếu trực tiếp và phần metadat
 ### 2.13. Sơ đồ vòng đời model trên GPU Kaggle
 
 ```mermaid
-stateDiagram-v2
-    [*] --> CPUParse: Bắt đầu ingestion
-    CPUParse --> VisionLoad: Có image, chart hoặc flowchart
-    CPUParse --> EmbedLoad: Không cần vision
-    VisionLoad --> VisionRun: Load PaddleOCR-VL-1.6
-    VisionRun --> VisionUnload: OCR/document vision hoàn tất
-    VisionUnload --> EmbedLoad: Giải phóng VRAM
-    EmbedLoad --> EmbedRun: Load dense embedding model
-    EmbedRun --> EmbedUnload: Index hoàn tất
-    EmbedUnload --> Persist: Export artifacts
-    Persist --> [*]
+flowchart LR
+    subgraph ING[Ingestion]
+        Parse[CPU: parse/chunk] --> OCR[GPU 1: PaddleOCR-VL]
+        OCR --> StopOCR[Stop worker / giải phóng VRAM]
+        StopOCR --> Embed[GPU 1: BGE-M3 embedding]
+        Embed --> Persist[CPU: Qdrant + BM25 + metadata]
+        Parse -. image phức tạp .-> VLM[GPU 0: optional Qwen-VL]
+    end
 
-    [*] --> ChatEmbed: Bắt đầu chat session
-    ChatEmbed --> Retrieve: Encode query
-    Retrieve --> RerankerLoad: Dense + BM25 + RRF
-    RerankerLoad --> Rerank: Load reranker
-    Rerank --> RerankerUnload: Chọn top chunks
-    RerankerUnload --> LLMLoad: Giải phóng VRAM
-    LLMLoad --> Generate: Load Qwen2.5-7B 4-bit
-    Generate --> LLMLoad: Câu hỏi tiếp theo
+    subgraph CHAT[Chat]
+        Query[Query] --> QueryEmbed[GPU 1: BGE-M3 query]
+        QueryEmbed --> Search[CPU: Qdrant + BM25 + RRF]
+        Search --> Rerank[CPU FP32: bge reranker]
+        Rerank --> Generate[GPU 0: Qwen2.5-7B 4-bit]
+    end
 ```
 
-Sơ đồ trên là mục tiêu logic. Cách load/offload thực tế được điều chỉnh theo GPU
-Kaggle cấp và thời gian chấp nhận được; không giữ VLM, embedding model, reranker và
-answer LLM đồng thời trên GPU.
+GPU 1 không giữ PaddleOCR-VL và BGE cùng lúc. GPU 0 không giữ answer Qwen trong
+ingestion; Qwen-VL chỉ được bật khi cần hiểu chart/flowchart phức tạp. Reranker ở
+CPU đổi một phần latency lấy VRAM ổn định và tận dụng 30 GiB RAM của Kaggle.
 
 </details>
 
@@ -861,7 +861,8 @@ Model này có chất lượng multilingual tốt nhưng dựa trên Gemma 2 9B,
 nặng cho Kaggle miễn phí. Các nguyên tắc vận hành bắt buộc:
 
 - Chạy embedding theo batch nhỏ.
-- Không giữ VLM hoặc answer LLM trên GPU cùng lúc.
+- Chỉ load BGE trên GPU 1 sau khi PaddleOCR-VL worker đã kết thúc.
+- Giữ Qwen/Qwen-VL trên GPU 0, tách khỏi OCR và embedding trên GPU 1.
 - Cache embedding để không encode lại chunk không thay đổi.
 - Chuẩn bị sẵn model weights trong Kaggle Dataset nếu notebook không có Internet.
 - Kiểm tra và chấp nhận license/model access trước khi đóng gói môi trường.
@@ -947,7 +948,7 @@ Giá trị khởi đầu: `k = 60`. Sau RRF giữ khoảng 20-30 child candidate
 
 - Input: tối đa khoảng 20-30 candidates.
 - Output: top 5-8 children.
-- Batch size phải điều chỉnh theo VRAM.
+- Preset T4 x2 chạy reranker FP32 trên CPU; batch size điều chỉnh theo RAM và latency.
 - Có thể tắt reranker bằng config để benchmark latency/quality.
 
 ### 9.4. Parent và relation expansion
@@ -1033,32 +1034,37 @@ thi instruction trong tài liệu và từ chối khi không có evidence.
 
 ## 12. Quản lý tài nguyên trên Kaggle
 
-Không load đồng thời mọi model lên GPU. Chia notebook thành hai mode hoặc hai
-notebook riêng.
+Preset vận hành giả định Kaggle luôn cấp T4 x2 và khoảng 30 GiB RAM:
+
+```text
+GPU 0: Qwen answer + optional Qwen-VL
+GPU 1: PaddleOCR-VL worker -> unload -> BGE-M3
+CPU: bge-reranker-v2-m3 FP32 + BM25 + Qdrant + parser/chunker/computation
+```
 
 ### Ingestion mode
 
 ```text
 Parse
-  -> load PaddleOCR-VL, xử lý page/image/chart, unload OCR-VL
-  -> optional: load Qwen-VL cho flowchart phức tạp, unload VLM
-  -> load embedding model, encode, unload embedding model
-  -> persist Qdrant + metadata + assets
+  -> GPU 1: load PaddleOCR-VL, xử lý page/image/chart, dừng worker
+  -> GPU 0 optional: load Qwen-VL cho flowchart phức tạp, unload VLM
+  -> GPU 1: chỉ sau khi OCR đã dừng, load BGE-M3, encode, unload embedding model
+  -> CPU: persist Qdrant + BM25 + metadata + assets
 ```
 
 ### Chat mode
 
 ```text
 Load Qdrant index
-  -> load embedding model để encode query, sau đó có thể offload
-  -> retrieve
-  -> load reranker, rerank, unload
-  -> load Qwen 7B, rewrite/answer
+  -> GPU 1: BGE-M3 encode query
+  -> CPU: Qdrant + BM25 + RRF retrieval
+  -> CPU FP32: rerank 20-30 candidates
+  -> GPU 0: Qwen 7B rewrite/answer
 ```
 
-Nếu việc đổi model quá chậm, ưu tiên cấu hình `bge-m3` cho query embedding và giữ
-Qwen 7B trên GPU. Không được dùng hai dense model khác nhau cho document và query
-trong cùng một index.
+Giữ BGE-M3 warm trên GPU 1 và Qwen 7B warm trên GPU 0 trong chat. Reranker CPU có
+thể tăng latency nhưng không cạnh tranh VRAM. Không được dùng hai dense model khác
+nhau cho document và query trong cùng một index.
 
 ### Persistence
 
@@ -1182,7 +1188,6 @@ Nguyên tắc:
 ```yaml
 runtime:
   environment: kaggle
-  device: cuda
   offline_mode: true
 
 parsing:
@@ -1191,6 +1196,7 @@ parsing:
   enable_ocr: true
   enable_vlm: false
   skip_decorative_images: true
+  ocr_cuda_visible_devices: "1"
 
 ocr:
   model: PaddleOCR-VL-1.6
@@ -1208,6 +1214,7 @@ chunking:
 embedding:
   model: BAAI/bge-multilingual-gemma2
   fallback_model: BAAI/bge-m3
+  device: cuda:1
   batch_size: 4
   normalize: true
 
@@ -1222,9 +1229,12 @@ retrieval:
 reranker:
   model: BAAI/bge-reranker-v2-m3
   enabled: true
+  device: cpu
+  use_fp16: false
 
 generation:
   model: Qwen/Qwen2.5-7B-Instruct
+  device: cuda:0
   load_in_4bit: true
   max_context_tokens: 12000
   max_new_tokens: 1024
@@ -1233,6 +1243,7 @@ generation:
 vision:
   model: Qwen/Qwen2.5-VL-3B-Instruct
   enabled: false
+  device: cuda:0
   load_in_4bit: true
 
 storage:

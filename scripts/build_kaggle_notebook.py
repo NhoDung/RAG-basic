@@ -28,8 +28,8 @@ Pipeline: **PDF/DOCX/Excel → PaddleOCR-VL-1.6 → Parent–Child → BGE → Q
 
 Trước khi chạy:
 
-1. Chọn Accelerator là **GPU T4 x2**. Notebook tự pin PaddleOCR-VL/Qwen vào GPU 0 và
-   embedding/reranker vào GPU 1. **Không dùng P100**: PaddleOCR-VL cần GPU
+1. Chọn Accelerator là **GPU T4 x2**. Notebook tự pin Qwen/Qwen-VL vào GPU 0; GPU 1
+   chạy tuần tự PaddleOCR-VL rồi BGE, còn reranker chạy CPU. **Không dùng P100**: PaddleOCR-VL cần GPU
    compute capability ≥ 7.0, P100 chỉ có 6.0.
 2. Bật **Internet** để tải dependency và model lần đầu.
 3. Chạy lần lượt các cell. Cell **Smoke test** kiểm tra toàn bộ pipeline trên tài liệu mẫu trước khi
@@ -165,8 +165,10 @@ config.parsing.enable_ocr = OCR_PYTHON is not None
 config.parsing.ocr_model_dir = None  # Đặt path Kaggle Dataset nếu chạy offline.
 
 # Kaggle hiện thường cấp T4 x2. Phân vai GPU thay vì shard Qwen 7B qua 2 GPU:
-# GPU 0: PaddleOCR-VL worker, Qwen answer và Qwen-VL optional.
-# GPU 1: BGE dense embedding và bge reranker.
+# GPU 0: Qwen answer và Qwen-VL optional.
+# GPU 1: PaddleOCR-VL worker -> BGE dense embedding.
+# CPU: bge reranker, BM25, Qdrant, parsing/chunking và structured computation.
+# OCR worker được dừng trước khi dense embedding bắt đầu nên không giữ VRAM trên GPU 1.
 # Nếu chỉ có một GPU, helper tự fallback toàn bộ về cuda:0.
 device_layout = configure_kaggle_devices(config)
 print("Device layout:", device_layout)
@@ -186,6 +188,7 @@ config.generation.query_rewrite_enabled = False
 print("OCR enabled:", config.parsing.enable_ocr)
 print("Dense device:", config.retrieval.dense_device)
 print("Reranker device:", config.retrieval.reranker_device)
+print("Reranker FP16:", config.retrieval.reranker_use_fp16)
 print("Qwen device:", config.generation.device or "auto")
 
 try:

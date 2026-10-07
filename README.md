@@ -18,8 +18,8 @@ PDF / DOCX / Excel
 ## Chạy trên Kaggle
 
 1. Upload [`notebooks/kaggle_full_pipeline.ipynb`](notebooks/kaggle_full_pipeline.ipynb) lên Kaggle.
-2. Chọn GPU **T4 x2** và bật Internet. Notebook pin PaddleOCR-VL/Qwen vào GPU 0, BGE/reranker
-   vào GPU 1; nếu Kaggle chỉ cấp một GPU thì tự fallback về GPU 0. Không dùng P100:
+2. Chọn GPU **T4 x2** và bật Internet. Notebook pin Qwen/Qwen-VL vào GPU 0; GPU 1 chạy tuần tự
+   PaddleOCR-VL rồi BGE, còn reranker chạy CPU. Nếu Kaggle chỉ cấp một GPU thì tự fallback về GPU 0. Không dùng P100:
    PaddleOCR-VL cần compute capability ≥ 7.0.
 3. Chạy lần lượt các cell. PaddleOCR-VL được cài vào venv riêng (`/tmp/paddle_env`) với
    `paddlepaddle-gpu` 3.x từ index chính thức của Paddle và được gọi qua subprocess, nên không
@@ -119,9 +119,11 @@ cross-GPU transfer có thể làm chat chậm hơn. Thay vào đó, `configure_k
 phân vai cố định:
 
 ```text
-GPU 0: PaddleOCR-VL worker -> Qwen answer -> Qwen-VL optional
-GPU 1: BGE-M3 dense embedding + bge-reranker-v2-m3
+GPU 0: Qwen answer + Qwen-VL optional
+GPU 1: PaddleOCR-VL worker -> BGE-M3 dense embedding
+CPU: bge-reranker-v2-m3 + BM25 + Qdrant + parsing/chunking/computation
 ```
 
-Nhờ vậy Qwen có thể giữ warm trên GPU 0 trong khi query embedding và rerank dùng
-GPU 1. Cell cấu hình trong notebook tự kiểm tra số GPU và áp dụng layout này.
+PaddleOCR-VL chỉ dùng GPU 1 trong giai đoạn parse; worker được dừng trước khi BGE bắt đầu
+embedding. Khi chat, BGE dùng GPU 1, reranker xử lý tập top-k nhỏ trên CPU và Qwen giữ warm
+trên GPU 0. Cell cấu hình trong notebook tự kiểm tra số GPU và áp dụng layout này.

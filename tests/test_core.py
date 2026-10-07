@@ -177,11 +177,18 @@ class UtilityTests(unittest.TestCase):
         config = PipelineConfig()
         layout = configure_kaggle_devices(config, gpu_count=2)
         self.assertEqual("dual_t4", layout["mode"])
-        self.assertEqual("0", config.parsing.ocr_cuda_visible_devices)
+        self.assertEqual("1", config.parsing.ocr_cuda_visible_devices)
         self.assertEqual("cuda:1", config.retrieval.dense_device)
-        self.assertEqual("cuda:1", config.retrieval.reranker_device)
+        self.assertEqual("cpu", config.retrieval.reranker_device)
+        self.assertFalse(config.retrieval.reranker_use_fp16)
         self.assertEqual("cuda:0", config.generation.device)
         self.assertEqual("cuda:0", config.vision.device)
+        self.assertEqual(["Qwen answer", "optional Qwen-VL"], layout["gpu_0"])
+        self.assertEqual(
+            ["PaddleOCR-VL worker", "BGE dense embedding"],
+            layout["gpu_1"],
+        )
+        self.assertIn("BGE reranker", layout["cpu"])
 
     def test_single_gpu_device_layout(self):
         config = PipelineConfig()
@@ -189,6 +196,13 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual("single_gpu", layout["mode"])
         self.assertEqual("cuda:0", config.retrieval.dense_device)
         self.assertEqual("cuda:0", config.retrieval.reranker_device)
+
+    def test_cpu_device_layout_disables_fp16_reranking(self):
+        config = PipelineConfig()
+        layout = configure_kaggle_devices(config, gpu_count=0)
+        self.assertEqual("cpu_only", layout["mode"])
+        self.assertEqual("cpu", config.retrieval.reranker_device)
+        self.assertFalse(config.retrieval.reranker_use_fp16)
 
 
 class ChunkingTests(unittest.TestCase):

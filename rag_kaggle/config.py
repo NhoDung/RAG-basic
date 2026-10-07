@@ -83,7 +83,8 @@ class RetrievalConfig:
     reranker_use_fp16: bool = True
     reranker_batch_size: int = 16
     # FlagEmbedding accepts an explicit device in current releases. Keeping this
-    # separate from dense_device lets a dual-T4 notebook reserve GPU 1 for retrieval.
+    # separate from dense_device lets a dual-T4 notebook run the low-volume
+    # reranking stage on CPU while GPU 1 handles OCR and dense embedding.
     reranker_device: str = "cuda"
     expand_relationships: bool = True
     max_related_blocks: int = 6

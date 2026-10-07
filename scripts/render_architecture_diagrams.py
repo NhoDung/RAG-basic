@@ -355,25 +355,25 @@ def render_storage():
 
 def render_gpu():
     d = Diagram(
-        "Chạy vừa GPU Kaggle miễn phí",
-        "Các model lớn được dùng lần lượt, không nằm trên GPU cùng lúc.",
+        "Phân bổ tài nguyên Kaggle T4 x2",
+        "GPU 0 cho Qwen; GPU 1 chạy OCR rồi BGE; reranker và storage dùng CPU/RAM.",
     )
     d.section((55, 175), (1490, 255), "INGESTION")
     ingest = [
         ("CPU parse", "Đọc file", "neutral"),
-        ("Load OCR-VL", "Đọc scan/hình/chart", "model"),
-        ("Unload OCR-VL", "Giải phóng VRAM", "store"),
-        ("Load embedding", "Tạo vectors", "model"),
-        ("Lưu index", "Export artifacts", "store"),
+        ("GPU 1: OCR-VL", "Đọc scan/hình/chart", "model"),
+        ("Stop OCR worker", "Giải phóng GPU 1", "store"),
+        ("GPU 1: BGE-M3", "Tạo vectors", "model"),
+        ("CPU storage", "Qdrant + BM25", "store"),
     ]
     horizontal_chain(d, ingest, 265, box_size=(235, 115), gap=42)
 
     d.section((55, 470), (1490, 255), "CHAT")
     chat = [
-        ("Encode query", "Dense vector", "model"),
-        ("Search", "Qdrant + BM25", "neutral"),
-        ("Rerank", "Load rồi unload", "model"),
-        ("Load Qwen 7B", "4-bit", "model"),
+        ("GPU 1: BGE-M3", "Encode query", "model"),
+        ("CPU search", "Qdrant + BM25", "neutral"),
+        ("CPU reranker", "FP32, top candidates", "neutral"),
+        ("GPU 0: Qwen 7B", "4-bit", "model"),
         ("Generate", "Answer + source", "output"),
     ]
     horizontal_chain(d, chat, 560, box_size=(235, 115), gap=42)
@@ -381,7 +381,7 @@ def render_gpu():
     d.box(
         (315, 785),
         (970, 75),
-        "Quy tắc: OCR-VL / Qwen-VL / embedding / reranker / LLM không cùng nằm trên GPU",
+        "Quy tắc: dừng OCR worker trước khi BGE dùng GPU 1; reranker chạy trên CPU",
         kind="danger",
     )
     d.save("06-kaggle-gpu-lifecycle.png")
