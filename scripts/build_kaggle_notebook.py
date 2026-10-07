@@ -90,25 +90,63 @@ INCLUDE_SOURCE_DOCUMENTS = False
     ),
     markdown("## 3. Cài PaddleOCR-VL trong môi trường riêng"),
     code(
-        """INSTALL_OCR = OCR_MODEL is not None
+        """import shutil
+
+INSTALL_OCR = OCR_MODEL is not None
 PADDLE_VERSION = "3.2.1"
 PADDLE_CUDA = "cu126"
 OCR_ENV = Path("/tmp/paddle_env")
 OCR_PYTHON = None
 
+
+def run(command):
+    print("$", " ".join(map(str, command)))
+    completed = subprocess.run(list(map(str, command)), capture_output=True, text=True)
+    if completed.returncode != 0:
+        print(completed.stdout[-2000:])
+        print(completed.stderr[-4000:])
+        raise RuntimeError(f"Command failed ({completed.returncode}): {command[0]}")
+    return completed.stdout
+
+
+def python_works(path):
+    return path.exists() and subprocess.run(
+        [str(path), "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+
+
 if INSTALL_OCR:
     try:
         python = OCR_ENV / "bin" / "python"
-        if not python.exists():
-            subprocess.check_call([sys.executable, "-m", "venv", str(OCR_ENV)])
+        if not python_works(python):
+            shutil.rmtree(OCR_ENV, ignore_errors=True)
+            try:
+                # Một số Kaggle image không có ensurepip đầy đủ.
+                run([sys.executable, "-m", "venv", str(OCR_ENV)])
+            except Exception:
+                shutil.rmtree(OCR_ENV, ignore_errors=True)
+                print("python -m venv failed; retrying with virtualenv...")
+                run([sys.executable, "-m", "pip", "install", "-q", "virtualenv"])
+                run([sys.executable, "-m", "virtualenv", str(OCR_ENV)])
+        if not python_works(python):
+            raise RuntimeError(f"OCR environment was created but Python is unusable: {python}")
         pip = [str(python), "-m", "pip", "install", "-q"]
-        subprocess.check_call(pip + ["--upgrade", "pip"])
-        subprocess.check_call(pip + [
+        run(pip + ["--upgrade", "pip"])
+        run(pip + [
             f"paddlepaddle-gpu=={PADDLE_VERSION}",
             "-i", f"https://www.paddlepaddle.org.cn/packages/stable/{PADDLE_CUDA}/",
             "--extra-index-url", "https://pypi.org/simple",
         ])
-        subprocess.check_call(pip + ["paddleocr[doc-parser]"])
+        run(pip + ["paddleocr[doc-parser]"])
+        print(run([
+            python,
+            "-c",
+            "import paddle, paddleocr; "
+            "print('paddle', paddle.__version__, 'cuda', paddle.device.is_compiled_with_cuda()); "
+            "print('paddleocr', paddleocr.__version__)",
+        ]))
         OCR_PYTHON = str(python)
     except Exception as exc:
         print("PaddleOCR-VL setup failed; OCR will be disabled:", exc)
