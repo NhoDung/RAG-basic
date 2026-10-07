@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "notebooks" / "kaggle_full_pipeline.ipynb"
+NOTEBOOK_DIR = ROOT / "notebooks"
 
 
 def markdown(source):
@@ -20,28 +20,7 @@ def code(source):
     }
 
 
-cells = [
-    markdown(
-        """# Multimodal RAG full pipeline trên Kaggle
-
-Pipeline: **PDF/DOCX/Excel → PaddleOCR-VL-1.6 → Parent–Child → BGE → Qdrant + BM25 → RRF → Reranker → Qwen → Gradio**.
-
-Trước khi chạy:
-
-1. Chọn Accelerator là **GPU T4 x2**. Notebook tự pin Qwen/Qwen-VL vào GPU 0; GPU 1
-   chạy tuần tự PaddleOCR-VL rồi BGE, còn reranker chạy CPU. **Không dùng P100**: PaddleOCR-VL cần GPU
-   compute capability ≥ 7.0, P100 chỉ có 6.0.
-2. Bật **Internet** để tải dependency và model lần đầu.
-3. Chạy lần lượt các cell. Cell **Smoke test** kiểm tra toàn bộ pipeline trên tài liệu mẫu trước khi
-   mở giao diện; nếu có bước FAIL, gửi lại output của cell đó để sửa.
-
-Preset mặc định dùng `BAAI/bge-m3` vì `bge-multilingual-gemma2` quá nặng khi chạy cùng Qwen 7B trên T4.
-LibreOffice (tuỳ chọn) giúp đọc `.xls` đầy đủ hơn: `!apt-get install -y libreoffice-calc`.
-"""
-    ),
-    markdown("## 1. Clone hoặc cập nhật source code"),
-    code(
-        """import os
+BOOTSTRAP = """import os
 import subprocess
 import sys
 from pathlib import Path
@@ -58,74 +37,75 @@ if not (Path.cwd() / "rag_kaggle").exists():
 
 PROJECT_DIR = Path.cwd()
 sys.path.insert(0, str(PROJECT_DIR))
-print("Project:", PROJECT_DIR)
-print(subprocess.run(["git", "log", "-1", "--oneline"], capture_output=True, text=True).stdout)
-"""
-    ),
-    markdown("## 2. Cài dependencies cho pipeline chính (PyTorch)"),
-    code(
-        """import subprocess
-import sys
-
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements-kaggle.txt"])
-print("Main dependencies installed.")
+print("Project:", PROJECT_DIR)
 """
-    ),
+
+
+def notebook(cells):
+    return {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.11"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+
+ingestion_cells = [
     markdown(
-        """## 3. Cài PaddleOCR-VL trong môi trường riêng
+        """# 01 - Build and freeze a RAG corpus
 
-PaddlePaddle và PyTorch dùng các bản CUDA/cuDNN khác nhau; tài liệu PaddleOCR-VL khuyên tách môi trường.
-Cell này tạo venv riêng ở `/tmp/paddle_env` (không tính vào dung lượng output), cài
-`paddlepaddle-gpu` 3.x từ index chính thức của Paddle (bản trên PyPI chỉ đến 2.6, không chạy được
-PaddleOCR-VL) và `paddleocr[doc-parser]`. Pipeline gọi OCR qua subprocess, nên PyTorch không bị ảnh hưởng
-và VRAM của OCR được giải phóng hoàn toàn sau khi parse.
-
-Nếu cài thất bại, pipeline vẫn chạy với OCR tắt (PDF có text, DOCX, Excel vẫn dùng được).
+Notebook này chỉ làm **Ingestion**. Nó nhận file, folder Kaggle Dataset hoặc ZIP; sau khi hoàn tất sẽ
+đóng băng kết quả thành `corpus_bundle.zip`. Notebook không load answer model hay mở chat.
 """
     ),
+    markdown("## 1. Cài đặt và import source"),
+    code(BOOTSTRAP),
+    markdown("## 2. Chọn model trực tiếp và khai báo input"),
     code(
-        """import subprocess
-import sys
-from pathlib import Path
+        """# Mỗi phần nhận trực tiếp Hugging Face model ID hoặc tên PaddleOCR.
+OCR_MODEL = "PaddleOCR-VL-1.6"
+VISION_MODEL = None  # Ví dụ: "Qwen/Qwen2.5-VL-3B-Instruct"
+EMBEDDING_MODEL = "BAAI/bge-m3"
+EMBEDDING_REVISION = None
+EMBEDDING_QUERY_INSTRUCTION = None
 
-INSTALL_OCR = True
-PADDLE_VERSION = "3.2.1"   # theo tài liệu PaddleOCR-VL
-PADDLE_CUDA = "cu126"      # đổi sang "cu118" nếu driver GPU của session quá cũ
+# Có thể trộn folder, ZIP và file đơn. Folder được duyệt đệ quy.
+INPUT_SOURCES = [
+    "/kaggle/input/my-documents",
+    # "/kaggle/input/my-documents/documents.zip",
+    # "/kaggle/input/my-documents/report.pdf",
+]
+
+WORK_DIR = Path("/kaggle/working/rag_ingestion")
+OUTPUT_BUNDLE = Path("/kaggle/working/corpus_bundle.zip")
+INCLUDE_SOURCE_DOCUMENTS = False
+"""
+    ),
+    markdown("## 3. Cài PaddleOCR-VL trong môi trường riêng"),
+    code(
+        """INSTALL_OCR = OCR_MODEL is not None
+PADDLE_VERSION = "3.2.1"
+PADDLE_CUDA = "cu126"
 OCR_ENV = Path("/tmp/paddle_env")
 OCR_PYTHON = None
-
-
-def run(command):
-    print("$", " ".join(map(str, command)))
-    completed = subprocess.run(list(map(str, command)), capture_output=True, text=True)
-    if completed.returncode != 0:
-        print(completed.stdout[-2000:], completed.stderr[-3000:])
-        raise RuntimeError(f"Command failed: {command[0]} ... (exit {completed.returncode})")
-    return completed.stdout
-
 
 if INSTALL_OCR:
     try:
         python = OCR_ENV / "bin" / "python"
         if not python.exists():
-            try:
-                run([sys.executable, "-m", "venv", OCR_ENV])
-            except RuntimeError:
-                run([sys.executable, "-m", "pip", "install", "-q", "virtualenv"])
-                run([sys.executable, "-m", "virtualenv", OCR_ENV])
-        pip = [python, "-m", "pip", "install", "-q"]
-        run(pip + ["--upgrade", "pip"])
-        run(pip + [
+            subprocess.check_call([sys.executable, "-m", "venv", str(OCR_ENV)])
+        pip = [str(python), "-m", "pip", "install", "-q"]
+        subprocess.check_call(pip + ["--upgrade", "pip"])
+        subprocess.check_call(pip + [
             f"paddlepaddle-gpu=={PADDLE_VERSION}",
             "-i", f"https://www.paddlepaddle.org.cn/packages/stable/{PADDLE_CUDA}/",
             "--extra-index-url", "https://pypi.org/simple",
         ])
-        run(pip + ["paddleocr[doc-parser]"])
-        check = run([python, "-c",
-                     "import paddle, paddleocr; print('paddle', paddle.__version__, 'cuda', "
-                     "paddle.device.is_compiled_with_cuda(), 'gpus', paddle.device.cuda.device_count()); "
-                     "print('paddleocr', paddleocr.__version__)"])
-        print(check)
+        subprocess.check_call(pip + ["paddleocr[doc-parser]"])
         OCR_PYTHON = str(python)
     except Exception as exc:
         print("PaddleOCR-VL setup failed; OCR will be disabled:", exc)
@@ -133,160 +113,128 @@ if INSTALL_OCR:
 print("OCR_PYTHON =", OCR_PYTHON)
 """
     ),
-    markdown("## 4. Kiểm tra GPU và import pipeline"),
+    markdown("## 4. Tạo ingestion runtime và kiểm tra tài nguyên"),
     code(
-        """import torch
+        """from rag_kaggle import (
+    IngestionPipeline, PipelineConfig, configure_ingestion_devices,
+    inspect_resources, suggest_model_upgrades,
+)
 
-print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
-if torch.cuda.is_available():
-    for index in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(index)
-        print(f"GPU {index}: {props.name}, compute capability {props.major}.{props.minor}, "
-              f"{props.total_memory / 1024**3:.1f} GB")
-    if torch.cuda.get_device_properties(0).major < 7:
-        print("⚠️ GPU này không hỗ trợ PaddleOCR-VL (cần compute capability ≥ 7.0). Hãy chọn T4.")
-else:
-    print("⚠️ Không thấy GPU. Vào Settings > Accelerator và chọn GPU T4.")
-
-from rag_kaggle import PipelineConfig, RAGPipeline, configure_kaggle_devices
-"""
-    ),
-    markdown("## 5. Cấu hình baseline chạy được trên T4"),
-    code(
-        """from pathlib import Path
-
-# Preset §16 Architecture.md; chỉnh trực tiếp trên object nếu cần.
 config = PipelineConfig.from_yaml(PROJECT_DIR / "configs" / "baseline.yaml")
-config.work_dir = Path("/kaggle/working/rag_runtime")
-
-# OCR/document vision chạy trong venv riêng (cell 3).
+config.work_dir = WORK_DIR
+config.parsing.ocr_model_name = OCR_MODEL or "PaddleOCR-VL-1.6"
 config.parsing.ocr_python = OCR_PYTHON
-config.parsing.enable_ocr = OCR_PYTHON is not None
-config.parsing.ocr_model_dir = None  # Đặt path Kaggle Dataset nếu chạy offline.
+config.parsing.enable_ocr = OCR_MODEL is not None and OCR_PYTHON is not None
+config.vision.enabled = VISION_MODEL is not None
+if VISION_MODEL:
+    config.vision.model = VISION_MODEL
+config.retrieval.dense_model = EMBEDDING_MODEL
+config.retrieval.dense_fallback_model = EMBEDDING_MODEL  # Không âm thầm đổi sang model khác.
+config.retrieval.dense_revision = EMBEDDING_REVISION
+config.retrieval.dense_query_instruction = EMBEDDING_QUERY_INSTRUCTION
+config.artifacts.include_source_documents = INCLUDE_SOURCE_DOCUMENTS
 
-# Kaggle hiện thường cấp T4 x2. Phân vai GPU thay vì shard Qwen 7B qua 2 GPU:
-# GPU 0: Qwen answer và Qwen-VL optional.
-# GPU 1: PaddleOCR-VL worker -> BGE dense embedding.
-# CPU: bge reranker, BM25, Qdrant, parsing/chunking và structured computation.
-# OCR worker được dừng trước khi dense embedding bắt đầu nên không giữ VRAM trên GPU 1.
-# Nếu chỉ có một GPU, helper tự fallback toàn bộ về cuda:0.
-device_layout = configure_kaggle_devices(config)
-print("Device layout:", device_layout)
-
-# Dense retrieval: bge-m3 cho T4. Nếu đổi sang BAAI/bge-multilingual-gemma2 thì phải
-# re-ingest với reset=True (không trộn 2 dense model trong một index) và đặt
-# config.retrieval.dense_query_instruction theo model card.
-config.retrieval.dense_model = "BAAI/bge-m3"
-
-# VLM Qwen2.5-VL-3B cho flowchart/chart phức tạp: tắt mặc định để tiết kiệm GPU.
-config.vision.enabled = False
-
-# Có thể tắt reranker khi muốn test nhanh hoặc thiếu VRAM.
-config.retrieval.reranker_enabled = True
-config.generation.query_rewrite_enabled = False
-
-print("OCR enabled:", config.parsing.enable_ocr)
-print("Dense device:", config.retrieval.dense_device)
-print("Reranker device:", config.retrieval.reranker_device)
-print("Reranker FP16:", config.retrieval.reranker_use_fp16)
-print("Qwen device:", config.generation.device or "auto")
-
-try:
-    print(subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout)
-except Exception as exc:
-    print("Không đọc được nvidia-smi:", exc)
+resources = inspect_resources()
+print("Resources:", resources)
+print("Allocation:", configure_ingestion_devices(config))
+print("Suggestions:", suggest_model_upgrades("ingestion", resources, config))
+pipeline = IngestionPipeline(config)
 """
     ),
-    markdown(
-        """## 6. Smoke test toàn pipeline
-
-Chạy mọi stage trên tài liệu mẫu nhỏ trong thư mục riêng (`/kaggle/working/rag_smoke`, tự xoá sau khi
-xong): môi trường → OCR → ingest → index → retrieve/rerank → Qwen → structured computation.
-Lần đầu sẽ tải toàn bộ model (Qwen 7B khoảng 15 GB) nên có thể mất 10–20 phút.
-
-- `PASS`: stage chạy đúng. `WARN`: chạy được nhưng kết quả cần xem lại. `FAIL`: lỗi, xem `detail`.
-- Các model được unload sau smoke test, nên không chiếm GPU của pipeline chính.
-"""
-    ),
+    markdown("## 5. Ingest, freeze và export"),
     code(
-        """from rag_kaggle.smoke import run_smoke_test
+        """report = pipeline.ingest_sources(INPUT_SOURCES, reset=True, progress=print)
+print("Ingestion stats:", report["stats"])
+if not report["ok"]:
+    raise RuntimeError(report["errors"])
 
-smoke = run_smoke_test(config)
-for step in smoke["steps"]:
-    if step["status"] != "PASS":
-        print(f"\\n--- {step['step']} ({step['status']}) ---\\n{step['detail']}")
-"""
-    ),
-    markdown("## 7. Khởi tạo pipeline chính"),
-    code(
-        """pipeline = RAGPipeline(config)
-print("Runtime:", config.work_dir)
-print("DB stats:", pipeline.metadata.stats())
-"""
-    ),
-    markdown(
-        """## 8. (Tuỳ chọn) Khôi phục index đã export
+bundle = pipeline.export_corpus_bundle(OUTPUT_BUNDLE)
+print("Frozen corpus:", pipeline.validate_corpus())
+print("Bundle:", bundle, f"({bundle.stat().st_size / 1024**2:.1f} MB)")
 
-Nếu đã upload `rag_artifacts.zip` thành Kaggle Dataset, khôi phục để chat ngay mà không cần ingest lại.
-"""
-    ),
-    code(
-        """ARTIFACTS = None  # ví dụ: "/kaggle/input/my-rag-artifacts/rag_artifacts.zip"
-if ARTIFACTS:
-    print(pipeline.restore_artifacts(ARTIFACTS))
-"""
-    ),
-    markdown(
-        """## 9. Chạy Gradio
-
-- **Ingestion**: chọn PDF/DOCX/XLSX là hệ thống tự parse và lập chỉ mục đúng một lần. Nhấn lại với cùng file sẽ bị từ chối; các file khác nội dung nhưng trùng tên được giữ thành version riêng.
-- **Tiến độ**: xem log theo trang PDF, block DOCX, sheet Excel, rồi embedding/Qdrant/BM25. Chỉ một ingestion được phép chạy tại một thời điểm.
-- **Chat**: hỏi đáp, xem citation, retrieved chunks, điểm dense/BM25/RRF/rerank, preview ảnh nguồn và trace.
-- **Evaluation**: upload dataset JSONL (xem `evaluation/dataset.sample.jsonl`).
-- **System**: thống kê, trạng thái từng stage, khôi phục artifacts.
-
-Lần chạy đầu sẽ tải model nên mất thời gian. Không đóng session trong lúc model đang tải.
-"""
-    ),
-    code(
-        """from rag_kaggle.ui import launch_demo
-
-launch_demo(pipeline, share=True, debug=False)
-"""
-    ),
-    markdown("## 10. API Python trực tiếp, evaluation và export artifacts"),
-    code(
-        """# report = pipeline.ingest(["/kaggle/input/my-data/file.pdf"])          # cộng dồn
-# report = pipeline.ingest([...], reset=True)                               # làm lại từ đầu
-# result = pipeline.ask("Phí thường niên của thẻ là bao nhiêu?")
-# print(result["answer"], result["citations"], result["warnings"])
-
-# Evaluation (§14):
-# metrics = pipeline.evaluate("/kaggle/input/my-eval/dataset.jsonl", run_answers=True)
-# print(metrics["retrieval"], metrics["answer"])
-
-# Export Qdrant, SQLite, parsed JSON/Parquet, assets, manifest trước khi session kết thúc:
-# archive = pipeline.export_artifacts("/kaggle/working/rag_artifacts.zip")
-# print(archive)
+from IPython.display import FileLink, display
+display(FileLink(str(bundle)))
 """
     ),
 ]
 
-notebook = {
-    "cells": cells,
-    "metadata": {
-        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-        "language_info": {"name": "python", "version": "3.11"},
-    },
-    "nbformat": 4,
-    "nbformat_minor": 5,
-}
 
-OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-OUTPUT.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
-print(f"Wrote {OUTPUT}")
+retrieval_cells = [
+    markdown(
+        """# 02 - Retrieve and answer from a frozen corpus
+
+Notebook này chỉ chạy **Retrieve & Answer**. Nó không có parser/OCR/VLM và không thể ingest thêm tài liệu.
+Embedding mặc định được đọc từ manifest của corpus để bảo đảm document/query dùng cùng model.
+"""
+    ),
+    markdown("## 1. Cài đặt và import source"),
+    code(BOOTSTRAP),
+    markdown("## 2. Chọn model trực tiếp"),
+    code(
+        """# None = bắt buộc kế thừa embedding model/revision/query instruction từ corpus manifest.
+EMBEDDING_MODEL = None
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # None để tắt reranker
+GENERATION_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+GENERATION_REVISION = None
+
+WORK_DIR = Path("/kaggle/working/rag_corpus")
+SESSION_DIR = Path("/kaggle/working/rag_session")
+
+# Đường dẫn từ Kaggle Dataset. Để None nếu muốn upload bundle trong Gradio.
+CORPUS_BUNDLE = None  # Ví dụ: "/kaggle/input/my-rag-corpus/corpus_bundle.zip"
+"""
+    ),
+    markdown("## 3. Tạo retrieval runtime và khôi phục corpus"),
+    code(
+        """from rag_kaggle import (
+    PipelineConfig, RetrievalAnswerPipeline, configure_retrieval_devices,
+    inspect_resources, suggest_model_upgrades,
+)
+
+config = PipelineConfig.from_yaml(PROJECT_DIR / "configs" / "baseline.yaml")
+config.work_dir = WORK_DIR
+config.runtime.session_dir = str(SESSION_DIR)
+config.retrieval.dense_model = EMBEDDING_MODEL
+config.retrieval.reranker_enabled = RERANKER_MODEL is not None
+if RERANKER_MODEL:
+    config.retrieval.reranker_model = RERANKER_MODEL
+config.generation.model = GENERATION_MODEL
+config.generation.revision = GENERATION_REVISION
+
+resources = inspect_resources()
+print("Resources:", resources)
+print("Allocation:", configure_retrieval_devices(config))
+print("Suggestions:", suggest_model_upgrades("retrieval", resources, config))
+pipeline = RetrievalAnswerPipeline(config)
+
+if CORPUS_BUNDLE:
+    restored = pipeline.restore_corpus_bundle(CORPUS_BUNDLE)
+    print("Corpus:", restored["manifest"])
+"""
+    ),
+    markdown("## 4. Mở Chat UI"),
+    code(
+        """from rag_kaggle.ui import launch_chat_demo
+
+# Tab System cho phép upload corpus_bundle.zip từ máy cá nhân nếu CORPUS_BUNDLE=None.
+launch_chat_demo(pipeline, share=True, debug=False)
+"""
+    ),
+    markdown("## 5. API Python trực tiếp"),
+    code(
+        """# result = pipeline.ask("Phí thường niên của thẻ Visa Gold là bao nhiêu?")
+# print(result["answer"], result["citations"])
+# metrics = pipeline.evaluate("/kaggle/input/my-evaluation/dataset.jsonl")
+"""
+    ),
+]
+
+
+NOTEBOOK_DIR.mkdir(parents=True, exist_ok=True)
+outputs = {
+    NOTEBOOK_DIR / "01_ingestion.ipynb": notebook(ingestion_cells),
+    NOTEBOOK_DIR / "02_retrieve_answer.ipynb": notebook(retrieval_cells),
+}
+for path, payload in outputs.items():
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"Wrote {path}")

@@ -4,14 +4,20 @@
 
 ### 1.0. Trạng thái implementation hiện tại
 
-Repository hiện chạy một notebook Kaggle duy nhất (`notebooks/kaggle_full_pipeline.ipynb`) và package
-`rag_kaggle/`; đây là nguồn đúng hơn cho các chi tiết triển khai so với cấu trúc tham khảo ở §17.
+Repository chạy hai notebook Kaggle độc lập và package `rag_kaggle/`:
 
-- Qdrant chạy embedded/local trong `/kaggle/working/rag_runtime`; BM25 là index local `bm25.pkl`.
+- `notebooks/01_ingestion.ipynb` xây dựng rồi đóng băng corpus.
+- `notebooks/02_retrieve_answer.ipynb` chỉ khôi phục corpus để retrieve/answer.
+
+- `IngestionPipeline` có parser/OCR/VLM/chunker và quyền ghi index; không tạo answer model/reranker.
+- `RetrievalAnswerPipeline` có query encoder/reranker/generator; không tạo parser/OCR/VLM và từ chối `ingest()`.
+- Qdrant chạy embedded/local; BM25 là index local `bm25.pkl`. Hai thành phần cùng metadata/assets được
+  đóng gói trong `corpus_bundle.zip` có manifest và checksum.
 - Dense model thực tế mặc định là `BAAI/bge-m3` (không phải `bge-multilingual-gemma2` ở baseline thiết kế),
   để cùng tồn tại với Qwen 7B trên T4; xem `configs/baseline.yaml`.
-- Gradio tự bắt đầu ingest khi người dùng upload. `RAGPipeline.ingest()` có mutex, vì vậy chỉ một
-  parse/index được chạy; upload lặp trong UI bị từ chối thay vì trở thành queue chờ.
+- Model được chọn trực tiếp bằng tên. Embedding model/revision/dimension/query instruction được khóa trong
+  corpus manifest; retrieval kế thừa các giá trị này hoặc dừng nếu config không tương thích.
+- Input ingestion có thể là folder, ZIP hoặc file đơn. Folder và ZIP được duyệt đệ quy để tìm tài liệu hỗ trợ.
 - File có cùng tên nhưng nội dung khác nhau được giữ là các version riêng. Một bản upload được nhận diện
   bằng `(original_file_name, content_hash)`; file gốc trong runtime dùng hậu tố hash để không ghi đè.
 - Tiến độ được gửi về UI theo PDF page, DOCX block, Excel sheet, dense embedding, Qdrant batch và BM25.
@@ -167,89 +173,40 @@ flowchart LR
 
 ### 2.8. Sơ đồ component và ranh giới triển khai
 
-Sơ đồ này thể hiện các module logic chạy trong Kaggle Notebook và các artifact cần
-được export trước khi session kết thúc.
+Sơ đồ này thể hiện ranh giới cứng giữa hai Kaggle session. Chỉ corpus bundle được
+chuyển từ session Ingestion sang session Retrieve & Answer.
 
 ```mermaid
 flowchart TB
-    U[Người dùng] --> UI[Gradio UI]
-
-    subgraph K["Kaggle Notebook - compute tạm thời"]
-        UI --> API[Application service]
-
-        API --> ING[Ingestion service]
-        API --> CHAT[Chat service]
-
-        subgraph P["Parsing layer"]
-            ROUTER[File router]
-            PDF[PDF parser]
-            DOCX[DOCX parser]
-            XLSX[Excel parser]
-            OCR[PaddleOCR-VL-1.6]
-            VLM[Qwen2.5-VL-3B optional]
-        end
-
-        subgraph R["RAG layer"]
-            CHUNK[Parent-child chunker]
-            EMBED[Dense and sparse encoder]
-            SEARCH[Hybrid retriever]
-            RERANK[bge-reranker-v2-m3]
-            CTX[Context builder]
-            LLM[Qwen2.5-7B-Instruct]
-            CITE[Citation validator]
-        end
-
-        ING --> ROUTER
-        ROUTER --> PDF
-        ROUTER --> DOCX
-        ROUTER --> XLSX
-        PDF --> OCR
+    subgraph I["01_ingestion.ipynb"]
+        INPUT[Folder / ZIP / files] --> ROUTER[File router]
+        ROUTER --> PDF[PDF parser]
+        ROUTER --> DOCX[DOCX parser]
+        ROUTER --> XLSX[Excel parser]
+        PDF --> OCR[PaddleOCR-VL]
         DOCX --> OCR
         XLSX --> OCR
-        OCR --> CHUNK
-        OCR -. complex visual logic .-> VLM
+        OCR --> CHUNK[Parent-child chunker]
+        OCR -. complex visual logic .-> VLM[Optional vision model]
         PDF --> CHUNK
         DOCX --> CHUNK
         XLSX --> CHUNK
         VLM --> CHUNK
-        CHUNK --> EMBED
-
-        CHAT --> SEARCH
-        SEARCH --> RERANK
-        RERANK --> CTX
-        CTX --> LLM
-        LLM --> CITE
-        CITE --> API
+        CHUNK --> EMBED[Dense embedding]
+        EMBED --> STORE[Qdrant + BM25 + metadata/assets]
+        STORE --> FREEZE[Freeze + manifest + checksums]
     end
 
-    subgraph S["Runtime storage"]
-        QD[(Qdrant)]
-        SQL[(SQLite metadata)]
-        PQ[(JSON and Parquet)]
-        ASSET[(Source and assets)]
+    FREEZE --> BUNDLE[(corpus_bundle.zip)]
+
+    subgraph R["02_retrieve_answer.ipynb"]
+        BUNDLE --> VALIDATE[Validate schema + checksums + embedding contract]
+        VALIDATE --> SEARCH[Qdrant + BM25 + RRF]
+        SEARCH --> RERANK[Reranker]
+        RERANK --> CTX[Parent/relationship expansion]
+        CTX --> LLM[Answer model]
+        LLM --> CITE[Answer + validated citations]
     end
-
-    EMBED --> QD
-    CHUNK --> SQL
-    CHUNK --> PQ
-    ING --> ASSET
-    SEARCH --> QD
-    CTX --> SQL
-    CTX --> PQ
-    CTX --> ASSET
-
-    subgraph D["Kaggle Dataset - persistent artifacts"]
-        SNAP[Qdrant snapshot]
-        META[Metadata and tables]
-        MEDIA[Required source assets]
-        MANIFEST[Config and manifest]
-    end
-
-    QD -. export .-> SNAP
-    SQL -. export .-> META
-    PQ -. export .-> META
-    ASSET -. export .-> MEDIA
-    ING -. export .-> MANIFEST
 ```
 
 ### 2.9. Sơ đồ tuần tự ingestion đa định dạng
@@ -267,7 +224,7 @@ sequenceDiagram
     participant Encoder as Embedding/BM25
     participant Store as Qdrant + structured storage
 
-    User->>UI: Upload PDF, DOCX hoặc Excel
+    User->>UI: Chọn folder, ZIP hoặc file PDF/DOCX/Excel
     UI->>UI: Claim upload batch, từ chối batch trùng/đang chạy
     UI->>Router: File + metadata
     Router->>Router: Validate MIME, hash, deduplicate theo tên gốc + hash
@@ -293,7 +250,8 @@ sequenceDiagram
     Encoder->>Encoder: Dense vectors + BM25 sparse vectors
     Encoder->>Store: Batch upsert Qdrant
     Store-->>UI: Manifest và trạng thái ingestion/progress
-    UI-->>User: Số document/block/chunk và lỗi nếu có
+    UI->>UI: Freeze + checksum corpus bundle
+    UI-->>User: corpus_bundle.zip và báo cáo document/block/chunk
 ```
 
 ### 2.10. Sơ đồ tổ chức dữ liệu và storage
@@ -407,8 +365,9 @@ flowchart LR
     subgraph ING[Ingestion]
         Parse[CPU: parse/chunk] --> OCR[GPU 1: PaddleOCR-VL]
         OCR --> StopOCR[Stop worker / giải phóng VRAM]
-        StopOCR --> Embed[GPU 1: BGE-M3 embedding]
+        StopOCR --> Embed[GPU 0: dense embedding]
         Embed --> Persist[CPU: Qdrant + BM25 + metadata]
+        Persist --> Freeze[Freeze corpus bundle]
         Parse -. image phức tạp .-> VLM[GPU 0: optional Qwen-VL]
     end
 
@@ -420,8 +379,8 @@ flowchart LR
     end
 ```
 
-GPU 1 không giữ PaddleOCR-VL và BGE cùng lúc. GPU 0 không giữ answer Qwen trong
-ingestion; Qwen-VL chỉ được bật khi cần hiểu chart/flowchart phức tạp. Reranker ở
+Ingestion không load answer Qwen; Chat không load PaddleOCR-VL hoặc Qwen-VL.
+Qwen-VL chỉ được bật khi cần hiểu chart/flowchart phức tạp. Reranker ở
 CPU đổi một phần latency lấy VRAM ổn định và tận dụng 30 GiB RAM của Kaggle.
 
 </details>
@@ -1034,12 +993,12 @@ thi instruction trong tài liệu và từ chối khi không có evidence.
 
 ## 12. Quản lý tài nguyên trên Kaggle
 
-Preset vận hành giả định Kaggle luôn cấp T4 x2 và khoảng 30 GiB RAM:
+Preset vận hành ưu tiên Kaggle T4 x2 và khoảng 30 GiB RAM. Hai session không giữ chung model:
 
 ```text
-GPU 0: Qwen answer + optional Qwen-VL
-GPU 1: PaddleOCR-VL worker -> unload -> BGE-M3
-CPU: bge-reranker-v2-m3 FP32 + BM25 + Qdrant + parser/chunker/computation
+Ingestion: GPU 0 embedding/optional VLM; GPU 1 PaddleOCR-VL
+Retrieve:  GPU 0 Qwen answer; GPU 1 query embedding
+CPU: Qdrant, BM25, metadata; reranker trong retrieve
 ```
 
 ### Ingestion mode
@@ -1048,8 +1007,9 @@ CPU: bge-reranker-v2-m3 FP32 + BM25 + Qdrant + parser/chunker/computation
 Parse
   -> GPU 1: load PaddleOCR-VL, xử lý page/image/chart, dừng worker
   -> GPU 0 optional: load Qwen-VL cho flowchart phức tạp, unload VLM
-  -> GPU 1: chỉ sau khi OCR đã dừng, load BGE-M3, encode, unload embedding model
+  -> GPU 0: load embedding model, encode, unload
   -> CPU: persist Qdrant + BM25 + metadata + assets
+  -> freeze corpus, ghi checksum và export corpus_bundle.zip
 ```
 
 ### Chat mode
@@ -1062,37 +1022,35 @@ Load Qdrant index
   -> GPU 0: Qwen 7B rewrite/answer
 ```
 
-Giữ BGE-M3 warm trên GPU 1 và Qwen 7B warm trên GPU 0 trong chat. Reranker CPU có
+Giữ query encoder warm trên GPU 1 và answer model warm trên GPU 0 trong chat. Reranker CPU có
 thể tăng latency nhưng không cạnh tranh VRAM. Không được dùng hai dense model khác
 nhau cho document và query trong cùng một index.
 
 ### Persistence
 
 Filesystem của Kaggle session không bền vững. Sau ingestion phải đóng gói thành
-Kaggle Dataset hoặc tải ra ngoài:
+`corpus_bundle.zip`, tải về máy hoặc tạo Kaggle Dataset. Bundle gồm:
 
 - Qdrant storage.
 - `metadata.db`.
 - Parsed JSON/Parquet.
 - Asset images cần cho citation/demo.
 - Ingestion manifest và config.
+- `corpus_manifest.json` chứa schema version, corpus ID và embedding contract.
+- `checksums.json` để phát hiện artifact thiếu/hỏng trước khi kích hoạt.
 
 Không cần đóng gói lại source model vào output dataset nếu đã có model dataset
-riêng và version được pin.
+riêng và version được pin. File nguồn mặc định không nằm trong bundle; có thể bật tùy chọn khi cần audit.
+Restore giải nén vào staging directory, xác minh đầy đủ rồi mới thay corpus đang hoạt động.
 
 ## 13. Demo và quan sát hệ thống
 
-Gradio UI tối thiểu gồm:
+Gradio được tách theo runtime:
 
-- Upload/chọn corpus; upload sẽ tự chạy ingestion đúng một lần.
-- Log streaming theo stage: file/batch, PDF page, DOCX block, Excel sheet, embedding, Qdrant và BM25.
-- Nút chạy lại chỉ để retry/reset có chủ đích; cùng bản upload không được xếp thêm queue.
-- Trạng thái từng stage và thông báo file trùng/bản version.
-- Chat input.
-- Answer và citations.
-- Retrieved child chunks.
-- Dense rank, BM25 rank, RRF score và reranker score.
-- Preview page image/table/chart nguồn khi có.
+- Ingestion UI nhận tài liệu/ZIP, stream tiến độ và trả `corpus_bundle.zip` để tải xuống.
+- Chat UI chỉ nhận corpus bundle, validate/activate rồi cung cấp chat, evaluation và diagnostics.
+- Chat UI không có upload tài liệu nguồn hoặc nút ingest.
+- Query trace được ghi vào session directory bên ngoài frozen corpus.
 
 Mỗi request cần có `trace_id`. Log JSON tối thiểu:
 
@@ -1306,7 +1264,7 @@ rag-basic/
 │   └── answer_metrics.py
 ├── notebooks/
 │   ├── 01_ingestion.ipynb
-│   └── 02_chat_demo.ipynb
+│   └── 02_retrieve_answer.ipynb
 ├── tests/
 ├── configs/
 │   └── baseline.yaml

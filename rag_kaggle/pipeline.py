@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import logging
+import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -13,7 +16,7 @@ from typing import Any, Callable
 
 from .chunking import ParentChildChunker
 from .computation import compute_from_blocks
-from .config import CHUNKER_VERSION, PARSER_VERSION, PipelineConfig
+from .config import ARTIFACT_SCHEMA_VERSION, CHUNKER_VERSION, PARSER_VERSION, PipelineConfig
 from .generation import LocalQwen
 from .guardrails import (
     REFUSAL_TEXT,
@@ -21,7 +24,7 @@ from .guardrails import (
     retrieval_confidence,
     unsupported_numbers,
 )
-from .ingestion import IngestionError, validate_file
+from .ingestion import IngestionError, discover_input_files, validate_file
 from .models import StageStatus
 from .paddleocr_vl import PaddleOCRVLAdapter
 from .parsers import DocumentParser, save_parsed_document, save_table_parquet
@@ -41,22 +44,37 @@ class IngestionInProgressError(RuntimeError):
     """Raised instead of queueing a second expensive ingestion run."""
 
 
+class PipelineModeError(RuntimeError):
+    """Raised when a stage is unavailable in the selected runtime mode."""
+
+
 class RAGPipeline:
-    def __init__(self, config: PipelineConfig | None = None):
+    VALID_MODES = {"full", "ingestion", "retrieval"}
+
+    def __init__(self, config: PipelineConfig | None = None, mode: str = "full"):
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Unknown pipeline mode: {mode}")
         self.config = config or PipelineConfig()
+        self.mode = mode
         self.config.create_directories()
-        self.ocr = PaddleOCRVLAdapter(
-            model_name=self.config.parsing.ocr_model_name,
-            model_dir=self.config.parsing.ocr_model_dir,
-            python_executable=self.config.parsing.ocr_python,
-            log_path=self.config.log_dir / "ocr_worker.log",
-            cuda_visible_devices=self.config.parsing.ocr_cuda_visible_devices,
-        )
-        self.vision = VisionReasoner(self.config)
-        self.parser = DocumentParser(self.config, self.ocr, self.vision)
-        self.chunker = ParentChildChunker(self.config.chunking)
-        self.reranker = Reranker(self.config)
-        self.generator = LocalQwen(self.config)
+        if mode in ("full", "ingestion"):
+            self.ocr = PaddleOCRVLAdapter(
+                model_name=self.config.parsing.ocr_model_name,
+                model_dir=self.config.parsing.ocr_model_dir,
+                python_executable=self.config.parsing.ocr_python,
+                log_path=self.config.log_dir / "ocr_worker.log",
+                cuda_visible_devices=self.config.parsing.ocr_cuda_visible_devices,
+            )
+            self.vision = VisionReasoner(self.config)
+            self.parser = DocumentParser(self.config, self.ocr, self.vision)
+            self.chunker = ParentChildChunker(self.config.chunking)
+        else:
+            self.ocr = self.vision = self.parser = self.chunker = None
+        if mode in ("full", "retrieval"):
+            self.reranker = Reranker(self.config)
+            self.generator = LocalQwen(self.config)
+        else:
+            self.reranker = self.generator = None
         # SQLite/Qdrant are mutable shared state; ingestion must be exclusive.
         self._ingestion_lock = threading.Lock()
         self._open_stores()
@@ -65,7 +83,11 @@ class RAGPipeline:
         self.metadata = MetadataStore(self.config.metadata_db)
         self.encoder = DenseEncoder(self.config, self.metadata)
         self.index = HybridIndex(self.config, self.metadata, self.encoder)
-        self.retriever = HybridRetriever(self.config, self.metadata, self.index, self.reranker)
+        self.retriever = (
+            HybridRetriever(self.config, self.metadata, self.index, self.reranker)
+            if self.reranker is not None
+            else None
+        )
 
     # --------------------------------------------------------------- ingestion
 
@@ -75,6 +97,12 @@ class RAGPipeline:
         reset: bool = False,
         progress: ProgressCallback | None = None,
     ) -> dict:
+        if self.mode not in ("full", "ingestion"):
+            raise PipelineModeError("Ingestion is disabled in retrieval-only mode.")
+        if self.metadata.get_setting("corpus.frozen", False):
+            raise PipelineModeError(
+                "This corpus is frozen. Create a new ingestion work_dir to build another corpus."
+            )
         if not self._ingestion_lock.acquire(blocking=False):
             raise IngestionInProgressError(
                 "An ingestion run is already in progress. Wait for it to finish before uploading another batch."
@@ -83,6 +111,20 @@ class RAGPipeline:
             return self._ingest(files, reset=reset, progress=progress)
         finally:
             self._ingestion_lock.release()
+
+    def ingest_sources(
+        self,
+        sources: list[str | Path],
+        reset: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> dict:
+        """Ingest supported documents discovered under files, directories or ZIP archives."""
+        files, discovery = discover_input_files(sources, self.config)
+        if not files:
+            raise ValueError("No supported documents were found in the configured input sources")
+        report = self.ingest(files, reset=reset, progress=progress)
+        report["input_discovery"] = discovery
+        return report
 
     def _ingest(
         self,
@@ -123,8 +165,10 @@ class RAGPipeline:
             notify("Đã xoá index cũ.")
         if self.config.runtime.unload_models_between_stages:
             # Free GPU for OCR/VLM/embedding; chat models reload lazily.
-            self.generator.unload()
-            self.reranker.unload()
+            if self.generator is not None:
+                self.generator.unload()
+            if self.reranker is not None:
+                self.reranker.unload()
 
         new_chunks = []
         for file_index, source in enumerate(paths, start=1):
@@ -152,7 +196,7 @@ class RAGPipeline:
                         "validation": facts,
                         "original_file_name": name,
                         "uploaded_at": uploaded_at,
-                        "stored_source": str(stored_source),
+                        "stored_source": stored_source.relative_to(self.config.work_dir).as_posix(),
                     }
                 )
                 warnings = document.metadata.get("warnings", [])
@@ -262,12 +306,19 @@ class RAGPipeline:
     # -------------------------------------------------------------------- chat
 
     def ask(self, query: str, filters: dict[str, Any] | None = None) -> dict:
+        if self.mode not in ("full", "retrieval"):
+            raise PipelineModeError("Question answering is disabled in ingestion-only mode.")
+        self.validate_corpus(require_frozen=self.mode == "retrieval")
         query = (query or "").strip()
         if not query:
             return {"answer": "Vui lòng nhập câu hỏi.", "citations": [], "trace": [], "warnings": []}
 
         guard = self.config.guardrails
-        trace = Trace("query", self.config.log_dir if self.config.runtime.log_traces else None, guard.mask_pii_in_logs)
+        trace = Trace(
+            "query",
+            self.config.session_dir if self.config.runtime.log_traces else None,
+            guard.mask_pii_in_logs,
+        )
         trace.set("query", query)
         warnings: list[str] = []
         if guard.enabled and guard.detect_prompt_injection and detect_prompt_injection(query):
@@ -395,43 +446,212 @@ class RAGPipeline:
     # --------------------------------------------------------------- utilities
 
     def evaluate(self, dataset_path: str | Path, run_answers: bool = True, ks: tuple[int, ...] = (5, 10)) -> dict:
+        if self.mode not in ("full", "retrieval"):
+            raise PipelineModeError("Evaluation is disabled in ingestion-only mode.")
         from .evaluation import run_evaluation
 
         return run_evaluation(self, dataset_path, run_answers=run_answers, ks=ks)
 
-    def export_artifacts(self, destination: str | Path | None = None) -> Path:
-        destination = Path(destination or self.config.work_dir.parent / "rag_artifacts.zip")
+    def freeze_corpus(self) -> dict[str, Any]:
+        """Seal the current index and write the compatibility contract used by chat sessions."""
+        if self.mode not in ("full", "ingestion"):
+            raise PipelineModeError("Only an ingestion runtime can freeze a corpus.")
+        stats = self.metadata.stats()
+        if not stats.get("chunks"):
+            raise RuntimeError("Cannot freeze an empty corpus")
+        corpus_id = self.metadata.get_setting("corpus.id") or uuid.uuid4().hex
+        self.metadata.set_setting("corpus.id", corpus_id)
+        self.metadata.set_setting("corpus.frozen", True)
+        manifest = {
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "corpus_id": corpus_id,
+            "frozen": True,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "collection_name": self.config.collection_name,
+            "stats": stats,
+            "embedding": {
+                "model": self.metadata.get_setting("index.dense_model"),
+                "revision": self.config.retrieval.dense_revision,
+                "dimension": self.metadata.get_setting("index.dimension"),
+                "normalize": True,
+                "query_instruction": self.config.retrieval.dense_query_instruction,
+            },
+            "models": {
+                "ocr": self.config.parsing.ocr_model_name,
+                "vision": self.config.vision.model if self.config.vision.enabled else None,
+            },
+            "versions": {"parser": PARSER_VERSION, "chunker": CHUNKER_VERSION},
+            "chunking": self.config.to_dict()["chunking"],
+        }
+        path = self.config.work_dir / "corpus_manifest.json"
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.metadata.connection.commit()
+        return manifest
+
+    def validate_corpus(self, require_frozen: bool = True) -> dict[str, Any]:
+        manifest_path = self.config.work_dir / "corpus_manifest.json"
+        if not manifest_path.exists():
+            if require_frozen:
+                raise RuntimeError("No frozen corpus is loaded. Restore a corpus bundle first.")
+            return {}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported corpus schema {manifest.get('artifact_schema_version')}; "
+                f"expected {ARTIFACT_SCHEMA_VERSION}."
+            )
+        if require_frozen and not manifest.get("frozen"):
+            raise RuntimeError("The loaded corpus is not frozen.")
+        if require_frozen and not self.metadata.get_setting("corpus.frozen", False):
+            raise RuntimeError("Metadata database does not mark this corpus as frozen.")
+        embedding = manifest.get("embedding") or {}
+        indexed_model = embedding.get("model")
+        if indexed_model != self.metadata.get_setting("index.dense_model"):
+            raise RuntimeError("Corpus manifest and metadata database disagree on the embedding model.")
+        if embedding.get("dimension") != self.metadata.get_setting("index.dimension"):
+            raise RuntimeError("Corpus manifest and metadata database disagree on vector dimension.")
+        configured_model = self.config.retrieval.dense_model
+        if configured_model is None:
+            self.config.retrieval.dense_model = indexed_model
+            self.config.retrieval.dense_revision = embedding.get("revision")
+            self.config.retrieval.dense_query_instruction = embedding.get("query_instruction")
+        elif indexed_model and configured_model != indexed_model:
+            raise RuntimeError(
+                f"Corpus uses embedding model {indexed_model}, but retrieval is configured with "
+                f"{configured_model}. Set dense_model=None to inherit it from the corpus."
+            )
+        else:
+            _adopt_or_validate_embedding_options(self.config, embedding)
+        if self.config.collection_name != manifest.get("collection_name"):
+            raise RuntimeError(
+                f"Corpus collection is {manifest.get('collection_name')}, but config uses "
+                f"{self.config.collection_name}."
+            )
+        if not (self.config.metadata_db.exists() and self.config.qdrant_dir.exists()):
+            raise RuntimeError("Corpus is missing metadata.db or Qdrant storage")
+        expected_stats = manifest.get("stats") or {}
+        current_stats = self.metadata.stats()
+        if any(current_stats.get(key) != value for key, value in expected_stats.items()):
+            raise RuntimeError("Corpus manifest and metadata database have different record counts.")
+        return manifest
+
+    def export_corpus_bundle(
+        self,
+        destination: str | Path | None = None,
+        include_source_documents: bool | None = None,
+    ) -> Path:
+        destination = Path(destination or self.config.work_dir.parent / "corpus_bundle.zip")
         if destination.resolve().is_relative_to(self.config.work_dir.resolve()):
-            raise ValueError("Artifact archive must be written outside work_dir")
+            raise ValueError("Corpus bundle must be written outside work_dir")
+        include_source = (
+            self.config.artifacts.include_source_documents
+            if include_source_documents is None
+            else include_source_documents
+        )
+        manifest = self.freeze_corpus()
+        manifest["bundle"] = {
+            "includes_source_documents": include_source,
+            "includes_parsed_documents": self.config.artifacts.include_parsed_documents,
+        }
+        (self.config.work_dir / "corpus_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         self.index.close()  # Release the Qdrant local lock while zipping.
         self.metadata.connection.commit()
-        base_name = destination.with_suffix("")
-        archive = shutil.make_archive(str(base_name), "zip", self.config.work_dir)
-        return Path(archive)
+        included_roots = {"qdrant", "metadata.db", "bm25.pkl", "manifests", "config.json", "manifest.json", "corpus_manifest.json", "tables", "assets"}
+        if self.config.artifacts.include_parsed_documents:
+            included_roots.add("parsed")
+        if include_source:
+            included_roots.add("source")
+        files = [
+            path for path in self.config.work_dir.rglob("*")
+            if path.is_file() and path.relative_to(self.config.work_dir).parts[0] in included_roots
+        ]
+        checksums = {
+            path.relative_to(self.config.work_dir).as_posix(): _sha256(path)
+            for path in sorted(files)
+        }
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+            for path in sorted(files):
+                bundle.write(path, path.relative_to(self.config.work_dir).as_posix())
+            bundle.writestr("checksums.json", json.dumps(checksums, ensure_ascii=False, indent=2))
+        return destination
+
+    def export_artifacts(self, destination: str | Path | None = None) -> Path:
+        """Backward-compatible alias for the frozen corpus bundle exporter."""
+        return self.export_corpus_bundle(destination)
+
+    def restore_corpus_bundle(self, archive: str | Path) -> dict:
+        """Validate and atomically activate a frozen corpus bundle."""
+        archive = Path(archive)
+        work_dir = self.config.work_dir.resolve()
+        work_dir.parent.mkdir(parents=True, exist_ok=True)
+        temporary_root = Path(tempfile.mkdtemp(prefix="rag_restore_", dir=work_dir.parent))
+        extracted = temporary_root / "corpus"
+        extracted.mkdir()
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                for member in bundle.namelist():
+                    target = (extracted / member).resolve()
+                    if not target.is_relative_to(extracted.resolve()):
+                        raise ValueError(f"Unsafe path in archive: {member}")
+                bundle.extractall(extracted)
+            _validate_extracted_bundle(extracted)
+            manifest = json.loads((extracted / "corpus_manifest.json").read_text(encoding="utf-8"))
+            embedding = manifest.get("embedding") or {}
+            configured_model = self.config.retrieval.dense_model
+            if configured_model is not None and configured_model != embedding.get("model"):
+                raise RuntimeError(
+                    f"Corpus uses embedding model {embedding.get('model')}, but retrieval is configured "
+                    f"with {configured_model}. Set dense_model=None to inherit it."
+                )
+            if configured_model is None:
+                self.config.retrieval.dense_model = embedding.get("model")
+                self.config.retrieval.dense_revision = embedding.get("revision")
+                self.config.retrieval.dense_query_instruction = embedding.get("query_instruction")
+            else:
+                _adopt_or_validate_embedding_options(self.config, embedding)
+            self.config.collection_name = manifest.get("collection_name", self.config.collection_name)
+
+            self.close()
+            backup = work_dir.parent / f".{work_dir.name}.backup-{uuid.uuid4().hex[:8]}"
+            try:
+                if work_dir.exists():
+                    os.replace(work_dir, backup)
+                os.replace(extracted, work_dir)
+                self.config.create_directories()
+                self._open_stores()
+                self.validate_corpus(require_frozen=True)
+            except Exception:
+                try:
+                    self.index.close()
+                    self.metadata.close()
+                except Exception:
+                    pass
+                if work_dir.exists():
+                    shutil.rmtree(work_dir)
+                if backup.exists():
+                    os.replace(backup, work_dir)
+                self.config.create_directories()
+                self._open_stores()
+                raise
+            else:
+                if backup.exists():
+                    shutil.rmtree(backup)
+            return {"manifest": manifest, "stats": self.metadata.stats()}
+        finally:
+            shutil.rmtree(temporary_root, ignore_errors=True)
 
     def restore_artifacts(self, archive: str | Path) -> dict:
-        """Load an exported ``rag_artifacts.zip`` (e.g. from a Kaggle Dataset) into work_dir."""
-        archive = Path(archive)
-        self.close()
-        work_dir = self.config.work_dir.resolve()
-        with zipfile.ZipFile(archive) as bundle:
-            for member in bundle.namelist():
-                target = (work_dir / member).resolve()
-                if not target.is_relative_to(work_dir):
-                    raise ValueError(f"Unsafe path in archive: {member}")
-            if self.config.metadata_db.exists():
-                self.config.metadata_db.unlink()
-            if self.config.qdrant_dir.exists():
-                shutil.rmtree(self.config.qdrant_dir)
-            bundle.extractall(work_dir)
-        self.config.create_directories()
-        self._open_stores()
-        return self.metadata.stats()
+        """Backward-compatible alias for restoring a frozen corpus bundle."""
+        result = self.restore_corpus_bundle(archive)
+        return result["stats"]
 
     @classmethod
     def from_artifacts(cls, archive: str | Path, config: PipelineConfig | None = None) -> "RAGPipeline":
         pipeline = cls(config)
-        pipeline.restore_artifacts(archive)
+        pipeline.restore_corpus_bundle(archive)
         return pipeline
 
     def _copy_source(self, source: Path, content_hash: str | None = None) -> Path:
@@ -445,6 +665,20 @@ class RAGPipeline:
     def close(self):
         self.index.close()
         self.metadata.close()
+
+
+class IngestionPipeline(RAGPipeline):
+    """Write-capable runtime used only to build and freeze a corpus."""
+
+    def __init__(self, config: PipelineConfig | None = None):
+        super().__init__(config, mode="ingestion")
+
+
+class RetrievalAnswerPipeline(RAGPipeline):
+    """Read-only application runtime; document ingestion is intentionally unavailable."""
+
+    def __init__(self, config: PipelineConfig | None = None):
+        super().__init__(config, mode="retrieval")
 
 
 def _hit_row(hit) -> dict:
@@ -470,3 +704,55 @@ def _count_statuses(statuses: list[dict]) -> dict[str, int]:
         key = f"{status['stage']}:{status['status']}"
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_extracted_bundle(root: Path) -> None:
+    required = ("corpus_manifest.json", "checksums.json", "metadata.db", "bm25.pkl", "qdrant")
+    missing = [name for name in required if not (root / name).exists()]
+    if missing:
+        raise RuntimeError("Corpus bundle is missing: " + ", ".join(missing))
+    manifest = json.loads((root / "corpus_manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("artifact_schema_version") != ARTIFACT_SCHEMA_VERSION or not manifest.get("frozen"):
+        raise RuntimeError("Corpus bundle has an unsupported schema or is not frozen")
+    checksums = json.loads((root / "checksums.json").read_text(encoding="utf-8"))
+    actual_files = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "checksums.json"
+    }
+    if actual_files != set(checksums):
+        missing = sorted(set(checksums) - actual_files)
+        unchecked = sorted(actual_files - set(checksums))
+        raise RuntimeError(f"Corpus checksum inventory mismatch; missing={missing}, unchecked={unchecked}")
+    for relative, expected in checksums.items():
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            raise RuntimeError(f"Corpus artifact is missing or unsafe: {relative}")
+        actual = _sha256(path)
+        if actual != expected:
+            raise RuntimeError(f"Checksum mismatch for corpus artifact: {relative}")
+
+
+def _adopt_or_validate_embedding_options(config: PipelineConfig, embedding: dict[str, Any]) -> None:
+    revision = embedding.get("revision")
+    if config.retrieval.dense_revision is not None and config.retrieval.dense_revision != revision:
+        raise RuntimeError(
+            f"Corpus embedding revision is {revision!r}, but config uses "
+            f"{config.retrieval.dense_revision!r}."
+        )
+    instruction = embedding.get("query_instruction")
+    if (
+        config.retrieval.dense_query_instruction is not None
+        and config.retrieval.dense_query_instruction != instruction
+    ):
+        raise RuntimeError("Corpus and retrieval use different dense query instructions.")
+    config.retrieval.dense_revision = revision
+    config.retrieval.dense_query_instruction = instruction

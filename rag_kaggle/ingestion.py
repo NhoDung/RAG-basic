@@ -6,11 +6,13 @@ import zipfile
 from pathlib import Path
 
 from .config import PipelineConfig
+from .utils import file_sha256
 
 
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 ZIP_MAGIC = b"PK\x03\x04"
 OOXML_EXTENSIONS = {".docx", ".xlsx", ".xlsm", ".xltx", ".xltm"}
+IGNORED_NAMES = {".ds_store", "thumbs.db"}
 
 
 class IngestionError(Exception):
@@ -18,6 +20,74 @@ class IngestionError(Exception):
         super().__init__(message)
         self.error_code = error_code
         self.retryable = retryable
+
+
+def discover_input_files(
+    sources: list[str | Path], config: PipelineConfig, staging_dir: Path | None = None
+) -> tuple[list[Path], dict]:
+    """Resolve files, folders and ZIP archives into a deterministic document list."""
+    staging_dir = staging_dir or config.work_dir.parent / "ingestion_staging"
+    accepted: list[Path] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[Path] = set()
+
+    def add_file(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        if path.name.lower() in IGNORED_NAMES or path.name.startswith("~$"):
+            skipped.append({"path": str(path), "reason": "temporary_or_system_file"})
+        elif path.suffix.lower() in config.ingestion.allowed_extensions:
+            accepted.append(path)
+        else:
+            skipped.append({"path": str(path), "reason": "unsupported_extension"})
+
+    for raw_source in sources:
+        source = Path(raw_source)
+        if not source.exists():
+            skipped.append({"path": str(source), "reason": "not_found"})
+            continue
+        if source.is_dir():
+            for child in sorted(source.rglob("*")):
+                if child.is_file():
+                    add_file(child)
+            continue
+        if source.suffix.lower() != ".zip":
+            add_file(source)
+            continue
+
+        digest = file_sha256(source)[:12]
+        target_root = staging_dir / f"{source.stem}__{digest}"
+        target_root.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(source) as bundle:
+            members = bundle.infolist()
+            if len(members) > config.ingestion.max_archive_files:
+                raise IngestionError(
+                    "archive_too_many_files",
+                    f"ZIP contains {len(members)} entries; limit is {config.ingestion.max_archive_files}",
+                )
+            uncompressed_mb = sum(member.file_size for member in members) / (1024 * 1024)
+            if uncompressed_mb > config.ingestion.max_archive_mb:
+                raise IngestionError(
+                    "archive_too_large",
+                    f"ZIP expands to {uncompressed_mb:.1f} MB; limit is {config.ingestion.max_archive_mb} MB",
+                )
+            for member in members:
+                target = (target_root / member.filename).resolve()
+                if not target.is_relative_to(target_root.resolve()):
+                    raise IngestionError("unsafe_zip", f"Unsafe path in ZIP: {member.filename}")
+            bundle.extractall(target_root)
+        for child in sorted(target_root.rglob("*")):
+            if child.is_file():
+                add_file(child)
+
+    accepted.sort(key=lambda path: str(path).lower())
+    return accepted, {
+        "sources": [str(Path(source)) for source in sources],
+        "accepted": [str(path) for path in accepted],
+        "skipped": skipped,
+    }
 
 
 def validate_file(path: Path, config: PipelineConfig) -> dict:

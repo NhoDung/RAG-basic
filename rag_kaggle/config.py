@@ -7,11 +7,14 @@ from typing import Any
 
 PARSER_VERSION = "0.2.0"
 CHUNKER_VERSION = "0.2.0"
+ARTIFACT_SCHEMA_VERSION = 1
 
 
 @dataclass
 class IngestionConfig:
     max_file_mb: int = 200
+    max_archive_mb: int = 4096
+    max_archive_files: int = 5000
     allowed_extensions: tuple[str, ...] = (".pdf", ".docx", ".xlsx", ".xlsm", ".xltx", ".xltm", ".xls")
     skip_unchanged_documents: bool = True
 
@@ -45,6 +48,7 @@ class ParsingConfig:
 class VisionConfig:
     enabled: bool = False
     model: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    revision: str | None = None
     load_in_4bit: bool = True
     max_new_tokens: int = 900
     max_retries: int = 2
@@ -67,7 +71,8 @@ class ChunkingConfig:
 
 @dataclass
 class RetrievalConfig:
-    dense_model: str = "BAAI/bge-m3"
+    dense_model: str | None = "BAAI/bge-m3"
+    dense_revision: str | None = None
     dense_fallback_model: str = "BAAI/bge-m3"
     dense_query_instruction: str | None = None
     dense_dimension: int | None = None
@@ -94,6 +99,7 @@ class RetrievalConfig:
 @dataclass
 class GenerationConfig:
     model: str = "Qwen/Qwen2.5-7B-Instruct"
+    revision: str | None = None
     load_in_4bit: bool = True
     max_new_tokens: int = 700
     max_context_chars: int = 28000
@@ -120,6 +126,14 @@ class RuntimeConfig:
     unload_models_between_stages: bool = True
     keep_answer_model_loaded: bool = True
     log_traces: bool = True
+    # Query traces live outside the frozen corpus so chat never mutates it.
+    session_dir: str | None = None
+
+
+@dataclass
+class ArtifactConfig:
+    include_source_documents: bool = False
+    include_parsed_documents: bool = True
 
 
 @dataclass
@@ -134,6 +148,7 @@ class PipelineConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     guardrails: GuardrailConfig = field(default_factory=GuardrailConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
 
     @property
     def source_dir(self) -> Path:
@@ -168,6 +183,10 @@ class PipelineConfig:
         return self.work_dir / "metadata.db"
 
     @property
+    def session_dir(self) -> Path:
+        return Path(self.runtime.session_dir) if self.runtime.session_dir else self.work_dir.parent / "rag_session"
+
+    @property
     def bm25_path(self) -> Path:
         return self.work_dir / "bm25.pkl"
 
@@ -183,6 +202,7 @@ class PipelineConfig:
             self.log_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def to_dict(self) -> dict[str, Any]:
         return _to_plain(self)

@@ -1,129 +1,154 @@
-# Multimodal RAG baseline
+# Multimodal RAG trên Kaggle
 
-End-to-end Vietnamese RAG pipeline designed for a free Kaggle GPU session:
+Pipeline được tách thành hai session độc lập:
 
 ```text
-PDF / DOCX / Excel
-→ validation + native parsing + PaddleOCR-VL-1.6 (+ Qwen2.5-VL tuỳ chọn)
-→ document graph (caption, tham chiếu, chart → bảng nguồn, bảng nối trang)
-→ Parent–Child chunking theo modality
-→ BGE dense embedding + BM25
-→ Qdrant + RRF (+ query rewrite và filter tuỳ chọn)
-→ bge-reranker-v2-m3
-→ parent/relationship expansion + structured computation
-→ Qwen2.5-7B-Instruct (JSON answer + source IDs)
-→ guardrails + Gradio answer with citations, trace và evaluation
+01_ingestion.ipynb
+PDF / DOCX / Excel / ZIP / folder
+-> parse + OCR/VLM -> parent-child chunking -> embedding
+-> Qdrant + BM25 + metadata/assets
+-> frozen corpus_bundle.zip
+
+02_retrieve_answer.ipynb
+corpus_bundle.zip -> validate manifest/checksum
+-> Qdrant + BM25 -> RRF -> reranker -> Qwen -> answer + citation
 ```
 
-## Chạy trên Kaggle
+Retrieve & Answer không chứa parser/OCR/VLM, không có API ingest và không thêm tài liệu vào corpus.
 
-1. Upload [`notebooks/kaggle_full_pipeline.ipynb`](notebooks/kaggle_full_pipeline.ipynb) lên Kaggle.
-2. Chọn GPU **T4 x2** và bật Internet. Notebook pin Qwen/Qwen-VL vào GPU 0; GPU 1 chạy tuần tự
-   PaddleOCR-VL rồi BGE, còn reranker chạy CPU. Nếu Kaggle chỉ cấp một GPU thì tự fallback về GPU 0. Không dùng P100:
-   PaddleOCR-VL cần compute capability ≥ 7.0.
-3. Chạy lần lượt các cell. PaddleOCR-VL được cài vào venv riêng (`/tmp/paddle_env`) với
-   `paddlepaddle-gpu` 3.x từ index chính thức của Paddle và được gọi qua subprocess, nên không
-   xung đột CUDA/cuDNN với PyTorch.
-4. Cell **Smoke test** chạy toàn bộ pipeline trên tài liệu mẫu và in PASS/WARN/FAIL cho từng stage.
-   Nếu có FAIL, xem `detail` của bước đó (log OCR worker ở `rag_smoke/logs/ocr_worker.log` khi
-   chạy `run_smoke_test(config, keep=True)`).
-5. Trong Gradio, upload tài liệu ở tab `Ingestion`; parse/index tự chạy một lần. Theo dõi log tiến độ,
-   sau đó hỏi ở tab `Chat`.
-6. Tải `rag_artifacts.zip` trước khi Kaggle session kết thúc. Lần sau có thể khôi phục bằng
-   `pipeline.restore_artifacts(...)` hoặc tab `System`.
+## 1. Chạy Ingestion
 
-Notebook tự clone repository này. Vì vậy cần push phiên bản source code mới nhất lên
-GitHub trước khi chạy notebook đã upload độc lập.
+Upload [01_ingestion.ipynb](notebooks/01_ingestion.ipynb) lên Kaggle, chọn GPU T4 x2 và sửa cell cấu hình đầu:
 
-## Chạy trực tiếp trong notebook đã clone repo
+```python
+OCR_MODEL = "PaddleOCR-VL-1.6"
+VISION_MODEL = None
+EMBEDDING_MODEL = "BAAI/bge-m3"
+EMBEDDING_REVISION = None
+
+INPUT_SOURCES = [
+    "/kaggle/input/my-documents",          # folder, duyệt đệ quy
+    # "/kaggle/input/my-documents/docs.zip",
+    # "/kaggle/input/my-documents/report.pdf",
+]
+```
+
+Input có thể là folder Kaggle Dataset, ZIP hoặc file đơn. Các định dạng được nhận gồm `.pdf`, `.docx`,
+`.xlsx`, `.xls`, `.xlsm`, `.xltx`, `.xltm`. Dùng folder Kaggle Dataset nhanh hơn ZIP. File `.xls` cần
+LibreOffice để chuyển đổi.
+
+Notebook tạo `/kaggle/working/corpus_bundle.zip`; tải file này về máy hoặc lưu thành Kaggle Dataset.
+Nếu muốn upload trực tiếp từ máy thay vì dùng Kaggle Dataset, có thể mở
+`launch_ingestion_demo(pipeline)` và tải file/ZIP trong Gradio.
+
+## 2. Chạy Retrieve & Answer
+
+Upload [02_retrieve_answer.ipynb](notebooks/02_retrieve_answer.ipynb) lên một session khác:
+
+```python
+# None: đọc embedding model bắt buộc từ corpus manifest.
+EMBEDDING_MODEL = None
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+GENERATION_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+CORPUS_BUNDLE = "/kaggle/input/my-rag-corpus/corpus_bundle.zip"
+```
+
+Có thể để `CORPUS_BUNDLE = None` rồi upload bundle từ máy trong tab `System` của Gradio.
+
+Embedding model, revision, dimension, normalization và query instruction là một phần của corpus. Nếu
+khai báo `EMBEDDING_MODEL` khác model đã ingest, restore sẽ dừng ngay. Reranker và generation model có
+thể đổi mà không cần ingest lại. Model ID vẫn phải tương thích với adapter tương ứng
+(`SentenceTransformer`, `FlagReranker`, causal LM hoặc vision-language model).
+
+## 3. Corpus bundle
+
+Bundle chứa dữ liệu cần để phục hồi đầy đủ retrieval và citation:
+
+```text
+corpus_bundle.zip
+├── corpus_manifest.json
+├── checksums.json
+├── config.json
+├── qdrant/
+├── metadata.db
+├── bm25.pkl
+├── tables/
+├── assets/
+└── parsed/
+```
+
+Qdrant là vector store chính nhưng không thay thế metadata, bảng gốc và assets dùng để mở rộng parent,
+tính toán và render citation. Source PDF/DOCX/Excel không được đưa vào bundle mặc định; bật
+`config.artifacts.include_source_documents` nếu cần giữ bản gốc.
+
+Restore luôn giải nén vào staging directory, kiểm tra path, schema và checksum trước khi thay corpus đang
+hoạt động. Query trace được ghi ra session directory riêng, không ghi vào frozen corpus.
+
+## 4. Python API
+
+### Ingestion
 
 ```python
 from pathlib import Path
-
-from rag_kaggle import PipelineConfig, RAGPipeline
+from rag_kaggle import IngestionPipeline, PipelineConfig, configure_ingestion_devices
 
 config = PipelineConfig.from_yaml("configs/baseline.yaml")
-config.work_dir = Path("/kaggle/working/rag_runtime")
-pipeline = RAGPipeline(config)
+config.work_dir = Path("/kaggle/working/rag_ingestion")
+config.retrieval.dense_model = "BAAI/bge-m3"
+config.retrieval.dense_fallback_model = config.retrieval.dense_model
+configure_ingestion_devices(config)
 
-report = pipeline.ingest(["/kaggle/input/my-documents/report.pdf"])  # reset=True để làm lại index
-result = pipeline.ask("Quy trình phê duyệt gồm những bước nào?")
-print(result["answer"], result["citations"], result["warnings"])
-
-metrics = pipeline.evaluate("evaluation/dataset.sample.jsonl")
+pipeline = IngestionPipeline(config)
+report = pipeline.ingest_sources(["/kaggle/input/my-documents"], reset=True)
+bundle = pipeline.export_corpus_bundle("/kaggle/working/corpus_bundle.zip")
 ```
 
-## Cấu trúc chính
+### Retrieve & Answer
+
+```python
+from pathlib import Path
+from rag_kaggle import PipelineConfig, RetrievalAnswerPipeline, configure_retrieval_devices
+
+config = PipelineConfig.from_yaml("configs/baseline.yaml")
+config.work_dir = Path("/kaggle/working/rag_corpus")
+config.retrieval.dense_model = None
+configure_retrieval_devices(config)
+
+pipeline = RetrievalAnswerPipeline(config)
+pipeline.restore_corpus_bundle("/kaggle/input/my-rag-corpus/corpus_bundle.zip")
+result = pipeline.ask("Quy trình phê duyệt gồm những bước nào?")
+print(result["answer"], result["citations"])
+```
+
+`RAGPipeline` vẫn tồn tại để tương thích với code cũ và test local, nhưng không được notebook mới sử dụng.
+
+## 5. Phân bổ tài nguyên
+
+T4 x2 trong Ingestion:
 
 ```text
-rag_kaggle/
-├── config.py           # Cấu hình dataclass, nạp từ YAML (configs/baseline.yaml)
-├── models.py           # Canonical Document Model: Document, Block, Relationship, Chunk
-├── ingestion.py        # Validate file (định dạng, kích thước, mật khẩu, macro), LibreOffice
-├── parsers.py          # PDF (heading theo font, bảng, scan), DOCX, Excel (KPI, chart, merged cells)
-├── paddleocr_vl.py     # PaddleOCR-VL adapter (in-process hoặc worker ở venv riêng)
-├── vision.py           # Qwen2.5-VL cho flowchart/chart (JSON, retry, needs_review)
-├── relationships.py    # Document graph (§5.3)
-├── chunking.py         # Parent–Child chunking theo modality
-├── storage.py          # SQLite, Qdrant (named vector, filter), BM25, embedding cache
-├── retrieval.py        # RRF, reranker, parent + relationship expansion, citation
-├── computation.py      # Tổng/trung bình/min/max/đếm trên bảng gốc bằng Python
-├── generation.py       # Query rewrite có cấu trúc và Qwen answer dạng JSON
-├── guardrails.py       # Prompt injection, PII masking, confidence, kiểm tra số liệu
-├── tracing.py          # trace_id + JSONL log theo stage
-├── evaluation.py       # Recall@k, MRR, correctness, citation/refusal accuracy
-├── pipeline.py         # End-to-end orchestration, manifest, export/restore artifacts
-├── smoke.py            # Smoke test toàn pipeline trên GPU Kaggle với tài liệu mẫu
-└── ui.py               # Gradio: Ingestion, Chat, Evaluation, System
+GPU 0: dense embedding -> optional VLM
+GPU 1: PaddleOCR-VL worker
+CPU: parser, chunker, Qdrant, BM25, metadata
 ```
 
-Thiết kế chi tiết nằm trong [`Architecture.md`](Architecture.md).
+T4 x2 trong Retrieve & Answer:
 
-## Khác biệt có chủ đích so với Architecture.md
+```text
+GPU 0: generation/query rewrite
+GPU 1: query embedding
+CPU: reranker, Qdrant, BM25, context expansion
+```
 
-- **Docling chưa được dùng**: parser hiện dùng PyMuPDF/python-docx/openpyxl trực tiếp, cộng
-  PaddleOCR-VL cho trang scan. Docling kéo theo nhiều dependency nặng dễ xung đột với
-  PaddlePaddle trên Kaggle; có thể thêm sau như một parser bổ sung.
-- **Dense model mặc định là `BAAI/bge-m3`** (fallback trong kiến trúc) vì `bge-multilingual-gemma2`
-  không vừa GPU T4 khi chạy cùng Qwen 7B.
-- **Cấu trúc package phẳng** `rag_kaggle/` thay vì chia nhiều package như §17, để notebook Kaggle
-  import đơn giản.
-- **BM25 là index local** (`bm25.pkl`), được §8.2 cho phép thay cho sparse vector trong Qdrant.
-- **Recalculation công thức Excel** chưa tự động; số cell công thức thiếu cached value được ghi
-  cảnh báo trong ingestion report.
+`inspect_resources()` báo GPU/VRAM, RAM và disk để đánh giá khả năng dùng model lớn hơn. Pipeline không
+tự đổi model âm thầm.
 
-## Test
+## 6. Test
 
 ```bash
 pip install pymupdf python-docx openpyxl pandas pyarrow pillow rank-bm25 qdrant-client numpy pyyaml
 python -m unittest discover -s tests
 ```
 
-Test end-to-end dùng encoder giả lập và LLM giả lập nên không cần GPU.
-
-## Ingestion UX
-
-Trong Gradio, chọn file là bắt đầu parse/index tự động. Nhấn nút parse thêm lần nữa
-cho cùng một bản upload sẽ bị từ chối, và pipeline cũng khóa để không có hai ingestion
-chạy đồng thời. Log hiển thị tiến độ PDF theo trang, DOCX theo block, Excel theo sheet,
-sau đó đến embedding, Qdrant, và BM25.
-
-File có cùng tên nhưng nội dung khác nhau được lưu thành các document version riêng.
-Mỗi version có `original_file_name`, `uploaded_at`, và `content_hash` trong SQLite và
-Qdrant payload; file nguồn nội bộ dùng hậu tố hash để không bị ghi đè.
-
-## T4 x2
-
-Notebook không tensor-parallel Qwen 7B qua hai T4 vì model 4-bit đã vừa một T4 và
-cross-GPU transfer có thể làm chat chậm hơn. Thay vào đó, `configure_kaggle_devices`
-phân vai cố định:
-
-```text
-GPU 0: Qwen answer + Qwen-VL optional
-GPU 1: PaddleOCR-VL worker -> BGE-M3 dense embedding
-CPU: bge-reranker-v2-m3 + BM25 + Qdrant + parsing/chunking/computation
-```
-
-PaddleOCR-VL chỉ dùng GPU 1 trong giai đoạn parse; worker được dừng trước khi BGE bắt đầu
-embedding. Khi chat, BGE dùng GPU 1, reranker xử lý tập top-k nhỏ trên CPU và Qwen giữ warm
-trên GPU 0. Cell cấu hình trong notebook tự kiểm tra số GPU và áp dụng layout này.
+Thiết kế chi tiết nằm trong [Architecture.md](Architecture.md).

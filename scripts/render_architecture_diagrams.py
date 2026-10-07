@@ -197,7 +197,7 @@ def render_overview():
         ("Ghép quan hệ", "Đoạn · bảng · biểu đồ", "process"),
         ("Chia nhỏ", "Parent và child", "process"),
         ("Tạo vector", "Dense và BM25", "model"),
-        ("Lưu", "Qdrant + dữ liệu gốc", "store"),
+        ("Đóng băng", "Qdrant + metadata bundle", "store"),
     ]
     top_positions = horizontal_chain(d, ingest, 260, box_size=(205, 125), gap=32)
 
@@ -211,7 +211,7 @@ def render_overview():
         ("Kết quả", "Answer + nguồn", "output"),
     ]
     bottom_positions = horizontal_chain(d, chat, 575, box_size=(205, 125), gap=32)
-    d.note((605, 447), "Kho kiến thức phía trên được luồng hỏi đáp phía dưới tra cứu.", max_width=600)
+    d.note((535, 447), "corpus_bundle.zip được chuyển sang session hỏi đáp; không ingest thêm.", max_width=720)
     d.note((70, 820), "Mục tiêu: tìm đúng bằng child chunk, trả lời đủ ngữ cảnh bằng parent và luôn chỉ ra nguồn.")
     d.save("01-system-overview.png")
 
@@ -332,13 +332,13 @@ def render_storage():
         "Mỗi loại dữ liệu có một nơi phù hợp",
         "Qdrant dùng để tìm kiếm, không phải nơi lưu toàn bộ dữ liệu nguồn.",
     )
-    d.box((600, 175), (400, 105), "RAG application", "Điều phối parse, search và answer", "output")
+    d.box((600, 175), (400, 105), "Frozen corpus bundle", "Manifest + checksum + dữ liệu retrieval", "output")
 
     stores = [
         (65, "Qdrant", "Vector + child chunks", "Tìm kiếm"),
         (450, "SQLite", "Parent + document graph", "Nối ngữ cảnh"),
         (835, "JSON / Parquet", "Hàng và cột gốc", "Tính toán"),
-        (1220, "File storage", "File gốc + ảnh crop", "Xem nguồn"),
+        (1220, "Asset storage", "Ảnh crop cần thiết", "Xem nguồn"),
     ]
     for x, title, body, role in stores:
         d.box((x, 410), (315, 150), title, f"{body}\n{role}", "store")
@@ -356,15 +356,15 @@ def render_storage():
 def render_gpu():
     d = Diagram(
         "Phân bổ tài nguyên Kaggle T4 x2",
-        "GPU 0 cho Qwen; GPU 1 chạy OCR rồi BGE; reranker và storage dùng CPU/RAM.",
+        "Hai session độc lập: ingestion không giữ Qwen answer; chat không load OCR/VLM.",
     )
     d.section((55, 175), (1490, 255), "INGESTION")
     ingest = [
         ("CPU parse", "Đọc file", "neutral"),
         ("GPU 1: OCR-VL", "Đọc scan/hình/chart", "model"),
-        ("Stop OCR worker", "Giải phóng GPU 1", "store"),
-        ("GPU 1: BGE-M3", "Tạo vectors", "model"),
-        ("CPU storage", "Qdrant + BM25", "store"),
+        ("GPU 0: VLM", "Chỉ khi cần", "model"),
+        ("GPU 0: embedding", "Tạo vectors", "model"),
+        ("Freeze bundle", "Qdrant + checksum", "store"),
     ]
     horizontal_chain(d, ingest, 265, box_size=(235, 115), gap=42)
 
@@ -381,7 +381,7 @@ def render_gpu():
     d.box(
         (315, 785),
         (970, 75),
-        "Quy tắc: dừng OCR worker trước khi BGE dùng GPU 1; reranker chạy trên CPU",
+        "Quy tắc: embedding trong chat phải trùng manifest; corpus không nhận thêm dữ liệu",
         kind="danger",
     )
     d.save("06-kaggle-gpu-lifecycle.png")

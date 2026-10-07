@@ -123,6 +123,13 @@ class DocumentParser:
         target.mkdir(parents=True, exist_ok=True)
         return target
 
+    def _artifact_ref(self, path: Path) -> str:
+        """Store corpus-relative paths so bundles can move between Kaggle sessions."""
+        try:
+            return path.resolve().relative_to(self.config.work_dir.resolve()).as_posix()
+        except ValueError:
+            return str(path)
+
     def _block(self, document: ParsedDocument, block_type: str, content: str, ordinal: object, **kwargs) -> Block:
         return Block(
             block_id=stable_id(document.document_id, block_type, ordinal),
@@ -184,7 +191,7 @@ class DocumentParser:
                 ocr_result["text"] or "(Ảnh không có chữ nhận dạng được)",
                 ordinal,
                 section_path=list(section_path),
-                asset_path=str(image_path),
+                asset_path=self._artifact_ref(image_path),
                 metadata=metadata,
                 raw_content=ocr_result.get("blocks") or None,
                 **kwargs,
@@ -198,7 +205,7 @@ class DocumentParser:
                     render_vlm_output(vlm_result["output"]),
                     f"{ordinal}-vlm",
                     section_path=list(section_path),
-                    asset_path=str(image_path),
+                    asset_path=self._artifact_ref(image_path),
                     metadata={"derived_from": image_block.block_id, "vlm_model": self.config.vision.model},
                     raw_content=vlm_result["output"],
                     page=kwargs.get("page"),
@@ -399,7 +406,7 @@ class DocumentParser:
         pixmap.save(image_path)
         ocr_result = self._run_ocr(document, image_path)
         layout_blocks = ocr_result.get("blocks") or []
-        common = {"page": page_number, "asset_path": str(image_path)}
+        common = {"page": page_number, "asset_path": self._artifact_ref(image_path)}
 
         if not layout_blocks:
             if ocr_result["text"]:
@@ -1195,7 +1202,7 @@ def save_table_parquet(document: ParsedDocument, table_dir: Path) -> int:
         except Exception as exc:  # pyarrow missing or unsupported types.
             LOGGER.warning("Could not write parquet for %s: %s", block.block_id, exc)
             return written
-        block.metadata["table_path"] = str(path)
+        block.metadata["table_path"] = path.relative_to(table_dir.parent).as_posix()
         written += 1
     return written
 

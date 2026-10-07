@@ -12,9 +12,10 @@ from rag_kaggle.config import ChunkingConfig, PipelineConfig
 from rag_kaggle.evaluation import answer_correct, hit_matches, retrieval_metrics
 from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
-from rag_kaggle.hardware import configure_kaggle_devices
+from rag_kaggle.hardware import configure_ingestion_devices, configure_kaggle_devices, configure_retrieval_devices
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
 from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
+from rag_kaggle.pipeline import IngestionPipeline, PipelineModeError, RetrievalAnswerPipeline
 from rag_kaggle.parsers import classify_excel_region, rows_to_markdown
 from rag_kaggle.relationships import build_relationships
 from rag_kaggle.storage import MetadataStore, qdrant_point_id, tokenize_vi
@@ -203,6 +204,24 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual("cpu_only", layout["mode"])
         self.assertEqual("cpu", config.retrieval.reranker_device)
         self.assertFalse(config.retrieval.reranker_use_fp16)
+
+    def test_stage_specific_device_layouts(self):
+        ingestion = PipelineConfig()
+        self.assertEqual("ingestion_dual_gpu", configure_ingestion_devices(ingestion, gpu_count=2)["mode"])
+        self.assertEqual("cuda:0", ingestion.retrieval.dense_device)
+        retrieval = PipelineConfig()
+        self.assertEqual("retrieval_dual_gpu", configure_retrieval_devices(retrieval, gpu_count=2)["mode"])
+        self.assertEqual("cuda:1", retrieval.retrieval.dense_device)
+
+    def test_separate_pipeline_modes_block_the_other_stage(self):
+        ingestion = IngestionPipeline.__new__(IngestionPipeline)
+        ingestion.mode = "ingestion"
+        retrieval = RetrievalAnswerPipeline.__new__(RetrievalAnswerPipeline)
+        retrieval.mode = "retrieval"
+        with self.assertRaises(PipelineModeError):
+            ingestion.ask("test")
+        with self.assertRaises(PipelineModeError):
+            retrieval.ingest([])
 
 
 class ChunkingTests(unittest.TestCase):
@@ -521,7 +540,7 @@ class EndToEndTests(unittest.TestCase):
 
         filtered = self.pipeline.ask("phí thường niên Visa Gold", filters={"source_file": "quy_trinh.docx"})
         self.assertTrue(all(row["source_file"] == "quy_trinh.docx" for row in filtered["trace"]))
-        self.assertTrue((self.pipeline.config.log_dir / "query_traces.jsonl").exists())
+        self.assertTrue((self.pipeline.config.session_dir / "query_traces.jsonl").exists())
 
         archive = self.pipeline.export_artifacts(Path(self.tmp.name) / "artifacts.zip")
         stats_before = self.pipeline.metadata.stats()
@@ -529,6 +548,41 @@ class EndToEndTests(unittest.TestCase):
         self.pipeline.encoder.model = FakeSentenceModel()
         self.pipeline.encoder.model_name = "fake-bow"
         self.assertTrue(self.pipeline.retriever.retrieve("Visa Gold"))
+
+        retrieval_config = PipelineConfig(work_dir=Path(self.tmp.name) / "retrieval_runtime")
+        retrieval_config.retrieval.dense_model = None
+        retrieval_config.retrieval.reranker_enabled = False
+        retrieval_config.runtime.unload_models_between_stages = False
+        retrieval = RetrievalAnswerPipeline(retrieval_config)
+        try:
+            restored = retrieval.restore_corpus_bundle(archive)
+            self.assertEqual(stats_before, restored["stats"])
+            self.assertEqual("fake-bow", retrieval.config.retrieval.dense_model)
+            retrieval.encoder.model = FakeSentenceModel()
+            retrieval.encoder.model_name = "fake-bow"
+            retrieval.generator._chat = lambda *args, **kwargs: json.dumps(
+                {"answer": "Theo tài liệu [SOURCE_1].", "source_ids": ["SOURCE_1"]}, ensure_ascii=False
+            )
+            frozen_stats = retrieval.metadata.stats()
+            self.assertTrue(retrieval.ask("Phí thường niên Visa Gold")["citations"])
+            self.assertEqual(frozen_stats, retrieval.metadata.stats())
+            with self.assertRaises(PipelineModeError):
+                retrieval.ingest(files)
+
+            import zipfile
+
+            corrupted = Path(self.tmp.name) / "corrupted.zip"
+            with zipfile.ZipFile(archive) as source, zipfile.ZipFile(corrupted, "w") as target:
+                for info in source.infolist():
+                    payload = source.read(info.filename)
+                    if info.filename == "metadata.db":
+                        payload += b"corruption"
+                    target.writestr(info, payload)
+            with self.assertRaises(RuntimeError):
+                retrieval.restore_corpus_bundle(corrupted)
+            self.assertEqual(frozen_stats, retrieval.metadata.stats())
+        finally:
+            retrieval.close()
 
         dataset = Path(self.tmp.name) / "eval.jsonl"
         dataset.write_text(

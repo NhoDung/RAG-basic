@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from .config import PipelineConfig
@@ -198,7 +199,7 @@ class HybridRetriever:
                 "block_ids": covered,
                 "related_block_ids": related_ids,
                 "citation": build_citation(hit),
-                "asset_paths": [hit.chunk.asset_path] if hit.chunk.asset_path else [],
+                "asset_paths": [self._resolve_artifact_path(hit.chunk.asset_path)] if hit.chunk.asset_path else [],
                 "order": (parent.source_file, parent.metadata.get("reading_order", 0)),
             }
             by_parent[parent.parent_id] = context
@@ -209,6 +210,10 @@ class HybridRetriever:
         for index, context in enumerate(contexts, start=1):
             context["source_id"] = f"SOURCE_{index}"
         return contexts
+
+    def _resolve_artifact_path(self, value: str) -> str:
+        path = Path(value)
+        return str(path if path.is_absolute() else self.config.work_dir / path)
 
     def _related_blocks(self, hit: SearchHit, exclude: set[str]) -> tuple[list[str], list[str]]:
         relations = self.metadata.related(hit.chunk.block_ids, EXPANSION_RELATIONS)

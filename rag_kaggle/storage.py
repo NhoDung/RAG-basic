@@ -376,8 +376,15 @@ class DenseEncoder:
         from sentence_transformers import SentenceTransformer
 
         name = self.config.retrieval.dense_model
+        if not name:
+            raise RuntimeError("dense_model is not configured; restore a corpus manifest or set a model name")
         try:
-            self.model = SentenceTransformer(name, trust_remote_code=True, device=self.config.retrieval.dense_device)
+            self.model = SentenceTransformer(
+                name,
+                revision=self.config.retrieval.dense_revision,
+                trust_remote_code=True,
+                device=self.config.retrieval.dense_device,
+            )
         except Exception as exc:
             fallback = self.config.retrieval.dense_fallback_model
             if not fallback or fallback == name:
@@ -385,7 +392,12 @@ class DenseEncoder:
             LOGGER.warning("Dense model %s failed to load (%s); using fallback %s", name, exc, fallback)
             release_cuda()
             name = fallback
-            self.model = SentenceTransformer(name, trust_remote_code=True, device=self.config.retrieval.dense_device)
+            self.model = SentenceTransformer(
+                name,
+                revision=self.config.retrieval.dense_revision,
+                trust_remote_code=True,
+                device=self.config.retrieval.dense_device,
+            )
         self.model_name = name
 
     def encode(self, texts: list[str], show_progress: bool = False, is_query: bool = False):
@@ -396,7 +408,8 @@ class DenseEncoder:
         if instruction:
             texts = [f"{instruction}{text}" for text in texts]
 
-        cache_keys = [text_sha1(f"{self.model_name}|{text}") for text in texts]
+        revision = self.config.retrieval.dense_revision or "default"
+        cache_keys = [text_sha1(f"{self.model_name}@{revision}|{text}") for text in texts]
         cached: dict[str, bytes] = {}
         if self.metadata is not None and not is_query:
             cached = self.metadata.cached_vectors(cache_keys)
@@ -507,6 +520,8 @@ class HybridIndex:
                 notify(f"Qdrant upsert batch {batch_number}/{total_batches}.")
             self.metadata.set_setting("index.dense_model", model_name)
             self.metadata.set_setting("index.dimension", dimension)
+            # Persist the model that actually produced the corpus, including fallback use.
+            self.config.retrieval.dense_model = model_name
 
         notify("Rebuilding BM25 index over the full corpus.")
         self._build_bm25(self.metadata.list_chunks())

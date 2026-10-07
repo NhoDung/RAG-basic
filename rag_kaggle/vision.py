@@ -87,10 +87,16 @@ class VisionReasoner:
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
-        self.processor = AutoProcessor.from_pretrained(self.config.vision.model)
+        self.processor = AutoProcessor.from_pretrained(
+            self.config.vision.model,
+            revision=self.config.vision.revision,
+            trust_remote_code=True,
+        )
         device_map = {"": self.config.vision.device} if self.config.vision.device else "auto"
         self.model = ModelClass.from_pretrained(
             self.config.vision.model,
+            revision=self.config.vision.revision,
+            trust_remote_code=True,
             device_map=device_map,
             torch_dtype="auto",
             quantization_config=quantization_config,

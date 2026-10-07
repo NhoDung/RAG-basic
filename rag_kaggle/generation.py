@@ -63,11 +63,13 @@ class LocalQwen:
             )
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.generation.model,
+            revision=self.config.generation.revision,
             trust_remote_code=True,
         )
         device_map = {"": self.config.generation.device} if self.config.generation.device else "auto"
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.generation.model,
+            revision=self.config.generation.revision,
             trust_remote_code=True,
             device_map=device_map,
             torch_dtype="auto",

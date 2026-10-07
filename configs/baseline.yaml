@@ -5,6 +5,8 @@ collection_name: rag_chunks
 
 ingestion:
   max_file_mb: 200
+  max_archive_mb: 4096
+  max_archive_files: 5000
   skip_unchanged_documents: true
 
 parsing:
@@ -21,6 +23,7 @@ parsing:
 vision:
   enabled: false               # Bật khi evaluation cho thấy cần hiểu flowchart/dashboard
   model: Qwen/Qwen2.5-VL-3B-Instruct
+  revision: null
   load_in_4bit: true
   max_retries: 2
   device: null                   # Notebook tự chọn GPU 0 khi T4 x2
@@ -37,6 +40,7 @@ retrieval:
   # Mục tiêu kiến trúc là BAAI/bge-multilingual-gemma2 (cần query instruction),
   # nhưng trên T4 cùng Qwen 7B nên dùng bge-m3. Không trộn 2 model trong 1 index.
   dense_model: BAAI/bge-m3
+  dense_revision: null
   dense_fallback_model: BAAI/bge-m3
   dense_batch_size: 4
   dense_top_k: 30
@@ -51,6 +55,7 @@ retrieval:
 
 generation:
   model: Qwen/Qwen2.5-7B-Instruct
+  revision: null
   load_in_4bit: true
   max_context_chars: 28000
   max_new_tokens: 1024
@@ -70,3 +75,8 @@ guardrails:
 runtime:
   unload_models_between_stages: true
   log_traces: true
+  session_dir: null             # Retrieve notebook đặt ngoài frozen corpus
+
+artifacts:
+  include_source_documents: false
+  include_parsed_documents: true

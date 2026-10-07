@@ -5,7 +5,7 @@ import queue
 import threading
 from pathlib import Path
 
-from .pipeline import RAGPipeline
+from .pipeline import IngestionPipeline, RAGPipeline, RetrievalAnswerPipeline
 from .utils import file_sha256
 
 
@@ -49,7 +49,7 @@ HIT_HEADERS = ["#", "file", "type", "page/sheet", "dense", "bm25", "RRF", "reran
 ALL = "(tất cả)"
 
 
-def build_demo(pipeline: RAGPipeline):
+def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_chat: bool = True):
     import gradio as gr
     upload_gate = UploadIngestionGate()
 
@@ -71,8 +71,10 @@ def build_demo(pipeline: RAGPipeline):
 
         def worker():
             try:
-                outcome["report"] = pipeline.ingest(accepted_paths, reset=reset, progress=messages.put)
-                outcome["archive"] = str(pipeline.export_artifacts())
+                outcome["report"] = pipeline.ingest_sources(accepted_paths, reset=reset, progress=messages.put)
+                if not outcome["report"].get("ok"):
+                    raise RuntimeError(f"Ingestion has errors: {outcome['report'].get('errors')}")
+                outcome["archive"] = str(pipeline.export_corpus_bundle())
             except Exception as exc:  # Reported in the UI instead of crashing the demo.
                 outcome["error"] = str(exc)
             finally:
@@ -181,75 +183,75 @@ def build_demo(pipeline: RAGPipeline):
             "# Multimodal RAG\n"
             "PDF, DOCX, Excel · PaddleOCR-VL · Parent–Child · Qdrant · BM25 · RRF · Reranker · Qwen"
         )
-        with gr.Tab("1. Ingestion"):
-            files = gr.File(
-                label="Upload tài liệu",
-                file_count="multiple",
-                file_types=[".pdf", ".docx", ".xlsx", ".xlsm", ".xls"],
-                type="filepath",
-            )
-            reset = gr.Checkbox(label="Xoá toàn bộ index cũ trước khi ingest", value=False)
-            ingest_button = gr.Button("Parse và lập chỉ mục", variant="primary")
-            stage_log = gr.Textbox(label="Trạng thái từng stage", lines=12, max_lines=30)
-            ingest_report = gr.Code(label="Ingestion report", language="json")
-            artifact = gr.File(label="Tải artifacts (Qdrant + SQLite + parsed + assets)")
+        if include_ingestion:
+            with gr.Tab("Ingestion"):
+                files = gr.File(
+                    label="Upload tài liệu",
+                    file_count="multiple",
+                    file_types=[".pdf", ".docx", ".xlsx", ".xlsm", ".xls", ".zip"],
+                    type="filepath",
+                )
+                reset = gr.Checkbox(label="Xoá toàn bộ index cũ trước khi ingest", value=False)
+                ingest_button = gr.Button("Parse, lập chỉ mục và đóng băng corpus", variant="primary")
+                stage_log = gr.Textbox(label="Trạng thái từng stage", lines=12, max_lines=30)
+                ingest_report = gr.Code(label="Ingestion report", language="json")
+                artifact = gr.File(label="Tải corpus_bundle.zip")
 
-        with gr.Tab("2. Chat"):
-            with gr.Row():
-                source_filter = gr.Dropdown(label="Lọc theo file", choices=[ALL], value=ALL)
-                type_filter = gr.Dropdown(label="Lọc theo loại nội dung", choices=[ALL], value=ALL)
-                refresh_filters = gr.Button("Làm mới bộ lọc")
-            chatbot = _chatbot(gr)
-            question = gr.Textbox(label="Câu hỏi", placeholder="Ví dụ: Phí thường niên thẻ Visa Gold là bao nhiêu?")
-            ask_button = gr.Button("Hỏi", variant="primary")
-            with gr.Accordion("Retrieved child chunks và điểm số", open=False):
-                hits_table = gr.Dataframe(headers=HIT_HEADERS, wrap=True)
-            with gr.Accordion("Context gửi cho LLM", open=False):
-                contexts_view = gr.Markdown()
-            with gr.Accordion("Preview nguồn (ảnh trang/hình)", open=False):
-                gallery = gr.Gallery(columns=3, height=360)
-            with gr.Accordion("Trace", open=False):
-                trace_view = gr.JSON()
+        if include_chat:
+            with gr.Tab("Chat"):
+                with gr.Row():
+                    source_filter = gr.Dropdown(label="Lọc theo file", choices=[ALL], value=ALL)
+                    type_filter = gr.Dropdown(label="Lọc theo loại nội dung", choices=[ALL], value=ALL)
+                    refresh_filters = gr.Button("Làm mới bộ lọc")
+                chatbot = _chatbot(gr)
+                question = gr.Textbox(label="Câu hỏi", placeholder="Ví dụ: Phí thường niên thẻ Visa Gold là bao nhiêu?")
+                ask_button = gr.Button("Hỏi", variant="primary")
+                with gr.Accordion("Retrieved child chunks và điểm số", open=False):
+                    hits_table = gr.Dataframe(headers=HIT_HEADERS, wrap=True)
+                with gr.Accordion("Context gửi cho LLM", open=False):
+                    contexts_view = gr.Markdown()
+                with gr.Accordion("Preview nguồn (ảnh trang/hình)", open=False):
+                    gallery = gr.Gallery(columns=3, height=360)
+                with gr.Accordion("Trace", open=False):
+                    trace_view = gr.JSON()
 
-        with gr.Tab("3. Evaluation"):
-            gr.Markdown(
-                "Upload file JSONL: mỗi dòng có `question`, `expected_answer`, `expected_document`, "
-                "`expected_location`, `expected_block_ids`, `content_type`, `category`."
-            )
-            dataset = gr.File(label="Dataset JSONL", file_types=[".jsonl", ".json"], type="filepath")
-            run_answers = gr.Checkbox(label="Chạy cả answer generation (chậm hơn)", value=True)
-            evaluate_button = gr.Button("Chạy evaluation", variant="primary")
-            evaluation_report = gr.JSON(label="Metrics")
+            with gr.Tab("Evaluation"):
+                gr.Markdown(
+                    "Upload file JSONL: mỗi dòng có `question`, `expected_answer`, `expected_document`, "
+                    "`expected_location`, `expected_block_ids`, `content_type`, `category`."
+                )
+                dataset = gr.File(label="Dataset JSONL", file_types=[".jsonl", ".json"], type="filepath")
+                run_answers = gr.Checkbox(label="Chạy cả answer generation (chậm hơn)", value=True)
+                evaluate_button = gr.Button("Chạy evaluation", variant="primary")
+                evaluation_report = gr.JSON(label="Metrics")
 
-        with gr.Tab("4. System"):
+        with gr.Tab("System"):
             refresh = gr.Button("Làm mới")
             stats = gr.JSON(value=pipeline.metadata.stats(), label="Database stats")
             documents = gr.Dataframe(value=_documents(pipeline), headers=["document_id", "source_file", "file_type"])
             statuses = gr.Dataframe(value=_statuses(pipeline), label="Ingestion status (mới nhất trước)")
-            restore_file = gr.File(label="Khôi phục từ rag_artifacts.zip", file_types=[".zip"], type="filepath")
-            restore_button = gr.Button("Khôi phục artifacts")
+            if include_chat:
+                restore_file = gr.File(label="Upload corpus_bundle.zip", file_types=[".zip"], type="filepath")
+                restore_button = gr.Button("Validate và kích hoạt corpus")
 
-        ingest_outputs = [stage_log, ingest_report, artifact, documents]
-        files.change(ingest_files, inputs=[files, reset], outputs=ingest_outputs).then(
-            filter_choices, outputs=[source_filter, type_filter]
-        )
-        ingest_button.click(ingest_files, inputs=[files, reset], outputs=ingest_outputs).then(
-            filter_choices, outputs=[source_filter, type_filter]
-        )
-        chat_outputs = [chatbot, question, hits_table, gallery, trace_view, contexts_view]
-        chat_inputs = [question, chatbot, source_filter, type_filter]
-        ask_button.click(respond, inputs=chat_inputs, outputs=chat_outputs)
-        question.submit(respond, inputs=chat_inputs, outputs=chat_outputs)
-        refresh_filters.click(filter_choices, outputs=[source_filter, type_filter])
-        evaluate_button.click(run_evaluation, inputs=[dataset, run_answers], outputs=evaluation_report)
+        if include_ingestion:
+            ingest_outputs = [stage_log, ingest_report, artifact, documents]
+            ingest_button.click(ingest_files, inputs=[files, reset], outputs=ingest_outputs)
+        if include_chat:
+            chat_outputs = [chatbot, question, hits_table, gallery, trace_view, contexts_view]
+            chat_inputs = [question, chatbot, source_filter, type_filter]
+            ask_button.click(respond, inputs=chat_inputs, outputs=chat_outputs)
+            question.submit(respond, inputs=chat_inputs, outputs=chat_outputs)
+            refresh_filters.click(filter_choices, outputs=[source_filter, type_filter])
+            evaluate_button.click(run_evaluation, inputs=[dataset, run_answers], outputs=evaluation_report)
+            restore_button.click(restore, inputs=restore_file, outputs=[stats, documents]).then(
+                filter_choices, outputs=[source_filter, type_filter]
+            )
+            demo.load(filter_choices, outputs=[source_filter, type_filter])
         refresh.click(
             lambda: (pipeline.metadata.stats(), _documents(pipeline), _statuses(pipeline)),
             outputs=[stats, documents, statuses],
         )
-        restore_button.click(restore, inputs=restore_file, outputs=[stats, documents]).then(
-            filter_choices, outputs=[source_filter, type_filter]
-        )
-        demo.load(filter_choices, outputs=[source_filter, type_filter])
 
     return demo
 
@@ -259,6 +261,18 @@ def launch_demo(pipeline: RAGPipeline, **kwargs):
     demo = build_demo(pipeline)
     allowed = {str(pipeline.config.work_dir), str(pipeline.config.work_dir.parent)}
     kwargs.setdefault("allowed_paths", sorted(allowed))
+    return demo.queue(default_concurrency_limit=1).launch(**kwargs)
+
+
+def launch_ingestion_demo(pipeline: IngestionPipeline, **kwargs):
+    demo = build_demo(pipeline, include_ingestion=True, include_chat=False)
+    kwargs.setdefault("allowed_paths", [str(pipeline.config.work_dir.parent)])
+    return demo.queue(default_concurrency_limit=1).launch(**kwargs)
+
+
+def launch_chat_demo(pipeline: RetrievalAnswerPipeline, **kwargs):
+    demo = build_demo(pipeline, include_ingestion=False, include_chat=True)
+    kwargs.setdefault("allowed_paths", [str(pipeline.config.work_dir), str(pipeline.config.work_dir.parent)])
     return demo.queue(default_concurrency_limit=1).launch(**kwargs)
 
 
