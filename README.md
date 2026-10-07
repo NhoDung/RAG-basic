@@ -21,16 +21,15 @@ Retrieve & Answer không chứa parser/OCR/VLM, không có API ingest và không
 Upload [01_ingestion.ipynb](notebooks/01_ingestion.ipynb) lên Kaggle, chọn GPU T4 x2 và sửa cell cấu hình đầu:
 
 ```python
+from pathlib import Path
+
 OCR_MODEL = "PaddleOCR-VL-1.6"
 VISION_MODEL = None
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
 
-INPUT_SOURCES = [
-    "/kaggle/input/my-documents",          # folder, duyệt đệ quy
-    # "/kaggle/input/my-documents/docs.zip",
-    # "/kaggle/input/my-documents/report.pdf",
-]
+INPUT_DATASET_SLUGS = ["raw-data"]  # tên trong panel Input
+INPUT_SOURCES = [Path("/kaggle/input") / slug for slug in INPUT_DATASET_SLUGS]
 ```
 
 Input có thể là folder Kaggle Dataset, ZIP hoặc file đơn. Các định dạng được nhận gồm `.pdf`, `.docx`,

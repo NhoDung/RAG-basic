@@ -121,7 +121,14 @@ class RAGPipeline:
         """Ingest supported documents discovered under files, directories or ZIP archives."""
         files, discovery = discover_input_files(sources, self.config)
         if not files:
-            raise ValueError("No supported documents were found in the configured input sources")
+            skipped = ", ".join(
+                f"{item['path']} ({item['reason']})" for item in discovery["skipped"][:20]
+            ) or "none"
+            raise ValueError(
+                "No supported documents were found. "
+                f"Configured sources: {discovery['sources']}. Skipped/not found: {skipped}. "
+                f"Supported extensions: {', '.join(self.config.ingestion.allowed_extensions)}"
+            )
         report = self.ingest(files, reset=reset, progress=progress)
         report["input_discovery"] = discovery
         return report

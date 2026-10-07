@@ -73,12 +73,15 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
 EMBEDDING_QUERY_INSTRUCTION = None
 
-# Có thể trộn folder, ZIP và file đơn. Folder được duyệt đệ quy.
-INPUT_SOURCES = [
-    "/kaggle/input/my-documents",
-    # "/kaggle/input/my-documents/documents.zip",
-    # "/kaggle/input/my-documents/report.pdf",
+# Tên hiển thị ở panel Input của Kaggle. Không cần biết folder con bên trong dataset.
+INPUT_DATASET_SLUGS = [
+    "raw-data",  # đổi theo tên dataset của bạn trong panel Input
 ]
+KAGGLE_INPUT_ROOT = Path("/kaggle/input")
+INPUT_SOURCES = [KAGGLE_INPUT_ROOT / slug for slug in INPUT_DATASET_SLUGS]
+
+# Có thể thêm đường dẫn file/folder cụ thể nếu cần:
+# INPUT_SOURCES.append(KAGGLE_INPUT_ROOT / "another-dataset" / "report.pdf")
 
 WORK_DIR = Path("/kaggle/working/rag_ingestion")
 OUTPUT_BUNDLE = Path("/kaggle/working/corpus_bundle.zip")
@@ -143,7 +146,29 @@ pipeline = IngestionPipeline(config)
     ),
     markdown("## 5. Ingest, freeze và export"),
     code(
-        """report = pipeline.ingest_sources(INPUT_SOURCES, reset=True, progress=print)
+        """from rag_kaggle.ingestion import discover_input_files
+
+print("Configured input sources:")
+for source in INPUT_SOURCES:
+    print(" -", source, "exists=" + str(source.exists()))
+
+files, discovery = discover_input_files(INPUT_SOURCES, config)
+print(f"Found {len(files)} supported document(s):")
+for path in files:
+    print(" -", path)
+if discovery["skipped"]:
+    print("Skipped/not found:")
+    for item in discovery["skipped"][:30]:
+        print(" -", item)
+if not files:
+    mounted = sorted(path.name for path in KAGGLE_INPUT_ROOT.iterdir()) if KAGGLE_INPUT_ROOT.exists() else []
+    raise ValueError(
+        f"Không tìm thấy tài liệu hỗ trợ. Dataset đang được mount: {mounted}. "
+        f"Hãy sửa INPUT_DATASET_SLUGS cho trùng tên trong panel Input."
+    )
+
+report = pipeline.ingest(files, reset=True, progress=print)
+report["input_discovery"] = discovery
 print("Ingestion stats:", report["stats"])
 if not report["ok"]:
     raise RuntimeError(report["errors"])
