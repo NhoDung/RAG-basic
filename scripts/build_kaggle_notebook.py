@@ -259,7 +259,9 @@ Embedding mặc định được đọc từ manifest của corpus để bảo �
     code(BOOTSTRAP, "02_retrieve_answer / 1. Cài đặt và import source"),
     markdown("## 2. Chọn model trực tiếp"),
     code(
-        """# None = bắt buộc kế thừa embedding model/revision/query instruction từ corpus manifest.
+        """import shutil
+
+# None = bắt buộc kế thừa embedding model/revision/query instruction từ corpus manifest.
 EMBEDDING_MODEL = None
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # None để tắt reranker
 GENERATION_MODEL = "Qwen/Qwen2.5-7B-Instruct"
@@ -268,8 +270,10 @@ GENERATION_REVISION = None
 WORK_DIR = Path("/kaggle/working/rag_corpus")
 SESSION_DIR = Path("/kaggle/working/rag_session")
 
-# Đường dẫn từ Kaggle Dataset. Để None nếu muốn upload bundle trong Gradio.
-CORPUS_BUNDLE = None  # Ví dụ: "/kaggle/input/my-rag-corpus/corpus_bundle.zip"
+# Thư mục corpus trong Kaggle Dataset được nén thành bundle để restore.
+CORPUS_SRC = "/kaggle/input/datasets/nhodng/data-test"
+CORPUS_BUNDLE = shutil.make_archive("/kaggle/working/corpus_bundle", "zip", root_dir=CORPUS_SRC)
+print("Bundle:", CORPUS_BUNDLE)
 """,
         "02_retrieve_answer / 2. Chọn model",
     ),
@@ -306,7 +310,7 @@ if CORPUS_BUNDLE:
     code(
         """from rag_kaggle.ui import launch_chat_demo
 
-# Tab System cho phép upload corpus_bundle.zip từ máy cá nhân nếu CORPUS_BUNDLE=None.
+# Tab System cho phép upload corpus_bundle.zip từ máy cá nhân nếu cần.
 launch_chat_demo(pipeline, share=True, debug=False)
 """,
         "02_retrieve_answer / 4. Mở Chat UI",

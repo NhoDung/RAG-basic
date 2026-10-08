@@ -15,3 +15,5 @@ rag_artifacts.zip
 
 raw-data/
 raw-data*
+
+.DS_Store
