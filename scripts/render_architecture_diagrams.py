@@ -362,7 +362,7 @@ def render_gpu():
     ingest = [
         ("CPU parse", "Đọc file", "neutral"),
         ("GPU 1: OCR-VL", "Đọc scan/hình/chart", "model"),
-        ("GPU 0: VLM", "Chỉ khi cần", "model"),
+        ("GPU 0: OCR correction", "Ordered correction", "model"),
         ("GPU 0: embedding", "Tạo vectors", "model"),
         ("Freeze bundle", "Qdrant + checksum", "store"),
     ]

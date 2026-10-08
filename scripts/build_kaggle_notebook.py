@@ -87,6 +87,7 @@ Notebook này chỉ làm **Ingestion**. Nó nhận file, folder Kaggle Dataset h
     code(
         """# Mỗi phần nhận trực tiếp Hugging Face model ID hoặc tên PaddleOCR.
 OCR_MODEL = "PaddleOCR-VL-1.6"
+OCR_CORRECTION_MODEL = "Qwen/Qwen2.5-3B-Instruct"  # None disables OCR spelling correction.
 VISION_MODEL = None  # Ví dụ: "Qwen/Qwen2.5-VL-3B-Instruct"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
@@ -187,6 +188,9 @@ config.work_dir = WORK_DIR
 config.parsing.ocr_model_name = OCR_MODEL or "PaddleOCR-VL-1.6"
 config.parsing.ocr_python = OCR_PYTHON
 config.parsing.enable_ocr = OCR_MODEL is not None and OCR_PYTHON is not None
+config.ocr_correction.enabled = OCR_CORRECTION_MODEL is not None
+if OCR_CORRECTION_MODEL:
+    config.ocr_correction.model = OCR_CORRECTION_MODEL
 config.vision.enabled = VISION_MODEL is not None
 if VISION_MODEL:
     config.vision.model = VISION_MODEL

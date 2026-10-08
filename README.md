@@ -24,6 +24,7 @@ Upload [01_ingestion.ipynb](notebooks/01_ingestion.ipynb) lên Kaggle, chọn GP
 from pathlib import Path
 
 OCR_MODEL = "PaddleOCR-VL-1.6"
+OCR_CORRECTION_MODEL = "Qwen/Qwen2.5-3B-Instruct"  # None to disable correction
 VISION_MODEL = None
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
@@ -127,10 +128,14 @@ print(result["answer"], result["citations"])
 T4 x2 trong Ingestion:
 
 ```text
-GPU 0: dense embedding -> optional VLM
+GPU 0: OCR spelling-correction LLM during parsing, then dense embedding
 GPU 1: PaddleOCR-VL worker
 CPU: parser, chunker, Qdrant, BM25, metadata
 ```
+
+OCR and correction overlap through a bounded ordered buffer. OCR may run ahead, while correction
+always processes the next reading-order component and receives only its immediately preceding
+corrected component as context. Both models unload before dense embedding starts.
 
 T4 x2 trong Retrieve & Answer:
 
