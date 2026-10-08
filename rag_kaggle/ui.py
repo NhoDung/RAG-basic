@@ -181,7 +181,7 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
     with gr.Blocks(title="Multimodal RAG - Kaggle") as demo:
         gr.Markdown(
             "# Multimodal RAG\n"
-            "PDF, DOCX, Excel · PaddleOCR-VL · Parent–Child · Qdrant · BM25 · RRF · Reranker · Qwen"
+            "PDF, DOCX, Excel · PaddleOCR-VL · Structure-aware · Qdrant · BM25 · RRF · Reranker · Qwen"
         )
         if include_ingestion:
             with gr.Tab("Ingestion"):
@@ -206,7 +206,7 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
                 chatbot = _chatbot(gr)
                 question = gr.Textbox(label="Câu hỏi", placeholder="Ví dụ: Phí thường niên thẻ Visa Gold là bao nhiêu?")
                 ask_button = gr.Button("Hỏi", variant="primary")
-                with gr.Accordion("Retrieved child chunks và điểm số", open=False):
+                with gr.Accordion("Retrieved chunks và điểm số", open=False):
                     hits_table = gr.Dataframe(headers=HIT_HEADERS, wrap=True)
                 with gr.Accordion("Context gửi cho LLM", open=False):
                     contexts_view = gr.Markdown()

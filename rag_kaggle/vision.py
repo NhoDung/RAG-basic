@@ -33,7 +33,7 @@ def classify_image(caption: str = "", ocr_text: str = "", ocr_labels: list[str] 
 FLOWCHART_PROMPT = """Ảnh là một sơ đồ/flowchart trong tài liệu nghiệp vụ tiếng Việt.
 Tiêu đề/caption: {caption}
 Mục: {section}
-Văn bản OCR (PaddleOCR-VL, dùng làm nguồn chữ chính xác):
+{previous}Văn bản OCR (PaddleOCR-VL, đã sửa chính tả, dùng làm nguồn chữ chính xác):
 {ocr_text}
 
 Hãy mô tả logic của sơ đồ. Chỉ dùng nhãn có trong ảnh/OCR, không bịa thêm bước.
@@ -46,7 +46,7 @@ Trả về DUY NHẤT một JSON object theo schema:
 CHART_PROMPT = """Ảnh là một biểu đồ/dashboard trong tài liệu nghiệp vụ tiếng Việt.
 Tiêu đề/caption: {caption}
 Mục: {section}
-Văn bản OCR (PaddleOCR-VL):
+{previous}Văn bản OCR (PaddleOCR-VL, đã sửa chính tả):
 {ocr_text}
 
 Tách riêng quan sát lấy trực tiếp từ nhãn/số liệu nhìn thấy (observations) và nhận xét
@@ -109,8 +109,12 @@ class VisionReasoner:
         ocr_text: str = "",
         caption: str = "",
         section: str = "",
+        previous_context: str = "",
     ) -> dict[str, Any]:
         """Return ``{"status": "success"|"needs_review"|"skipped", "output": dict|None}``.
+
+        ``previous_context`` is the end of the single preceding page (never more), used
+        only to understand content that continues across the page break.
 
         Invalid JSON is retried a bounded number of times and then marked
         ``needs_review``; nothing is invented as a replacement.
@@ -122,6 +126,12 @@ class VisionReasoner:
             caption=caption or "(không có)",
             section=section or "(không rõ)",
             ocr_text=(ocr_text or "(trống)")[:3000],
+            previous=(
+                "Ngữ cảnh cuối trang liền trước (chỉ để hiểu phần nối tiếp; không chép thành nhãn của ảnh):\n"
+                f"{previous_context.strip()[: self.config.vision.previous_page_chars]}\n"
+                if previous_context.strip()
+                else ""
+            ),
         )
         errors = []
         for attempt in range(self.config.vision.max_retries + 1):

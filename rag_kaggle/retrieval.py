@@ -6,9 +6,9 @@ from typing import Any
 
 from .config import PipelineConfig
 from .guardrails import sanitize_context
-from .models import Block, SearchHit
+from .models import Block, Chunk, SearchHit
 from .storage import HybridIndex, MetadataStore, release_cuda
-from .utils import text_sha1
+from .utils import rows_to_markdown, text_sha1
 
 
 EXPANSION_RELATIONS = ("captioned_by", "referenced_by", "visualizes", "continues", "derived_from")
@@ -80,8 +80,9 @@ class HybridRetriever:
         filters: dict[str, Any] | None = None,
         keyword_query: str | None = None,
         top_k: int | None = None,
+        boost_document_ids: list[str] | None = None,
     ) -> list[SearchHit]:
-        hits, _ = self.retrieve_with_trace(query, query_variants, filters, keyword_query, top_k)
+        hits, _ = self.retrieve_with_trace(query, query_variants, filters, keyword_query, top_k, boost_document_ids)
         return hits
 
     def retrieve_with_trace(
@@ -91,6 +92,7 @@ class HybridRetriever:
         filters: dict[str, Any] | None = None,
         keyword_query: str | None = None,
         top_k: int | None = None,
+        boost_document_ids: list[str] | None = None,
     ) -> tuple[list[SearchHit], dict[str, Any]]:
         retrieval = self.config.retrieval
         queries = [query]  # The original question is always searched (§9.1).
@@ -98,17 +100,23 @@ class HybridRetriever:
             if variant and variant not in queries:
                 queries.append(variant)
 
-        rankings: list[tuple[str, list[str]]] = []
+        rankings: list[tuple[str, list[str], str]] = []
         for current_query in queries:
-            rankings.append(("dense", self.index.dense_search(current_query, retrieval.dense_top_k, filters)))
-            rankings.append(("sparse", self.index.sparse_search(current_query, retrieval.sparse_top_k, filters)))
+            rankings.append(("dense", self.index.dense_search(current_query, retrieval.dense_top_k, filters), "all"))
+            rankings.append(("sparse", self.index.sparse_search(current_query, retrieval.sparse_top_k, filters), "all"))
         if keyword_query and keyword_query not in queries:
-            rankings.append(("sparse", self.index.sparse_search(keyword_query, retrieval.sparse_top_k, filters)))
+            rankings.append(("sparse", self.index.sparse_search(keyword_query, retrieval.sparse_top_k, filters), "all"))
+        if boost_document_ids and retrieval.entity_boost and "document_id" not in (filters or {}):
+            # Soft boost: documents that mention an entity from the question get one more
+            # dense and sparse ranking restricted to them, fused through RRF, never a hard filter.
+            scoped = {**(filters or {}), "document_id": list(dict.fromkeys(boost_document_ids))}
+            rankings.append(("dense", self.index.dense_search(query, retrieval.dense_top_k, scoped), "entity"))
+            rankings.append(("sparse", self.index.sparse_search(query, retrieval.sparse_top_k, scoped), "entity"))
 
         scores: dict[str, float] = defaultdict(float)
         dense_rank: dict[str, int] = {}
         sparse_rank: dict[str, int] = {}
-        for kind, ranking in rankings:
+        for kind, ranking, _scope in rankings:
             for rank, chunk_id in enumerate(ranking, start=1):
                 scores[chunk_id] += 1.0 / (retrieval.rrf_k + rank)
                 target = dense_rank if kind == "dense" else sparse_rank
@@ -143,36 +151,39 @@ class HybridRetriever:
             "queries": queries,
             "keyword_query": keyword_query,
             "filters": filters or {},
-            "rankings": [{"retriever": kind, "ids": ranking[:10]} for kind, ranking in rankings],
+            "rankings": [{"retriever": kind, "scope": scope, "ids": ranking[:10]} for kind, ranking, scope in rankings],
+            "boost_document_ids": boost_document_ids or [],
             "fused_ids": fused_ids,
         }
         return hits[: top_k or retrieval.rerank_top_k], stage_trace
 
     def expand_context(self, hits: list[SearchHit], max_chars: int | None = None) -> list[dict]:
-        """Parent + relationship expansion with dedup and a character budget (§9.4)."""
+        """Chunk + neighbour + relationship expansion with dedup and a character budget (§9.4).
+
+        A chunk is already a whole unit (text run, table or image), so there is no parent
+        to fetch. Text chunks are widened with adjacent chunks of the same section; large
+        tables, indexed as a preview, are expanded to their full rows within a budget.
+        """
         retrieval = self.config.retrieval
         budget = max_chars or self.config.generation.max_context_chars
         contexts: list[dict] = []
-        by_parent: dict[str, dict] = {}
+        seen_chunks: set[str] = set()
         seen_blocks: set[str] = set()
         seen_hashes: set[str] = set()
         used = 0
 
         for hit in hits:
-            existing = by_parent.get(hit.chunk.parent_id)
-            if existing is not None:
-                existing["hits"].append(hit)
+            chunk = hit.chunk
+            if chunk.chunk_id in seen_chunks:
                 continue
-            parent = self.metadata.get_parent(hit.chunk.parent_id)
-            if parent is None:
-                continue
-
-            if len(parent.content) <= retrieval.max_parent_chars_in_context:
-                body, covered = parent.content, list(parent.block_ids)
-            else:
-                # Large parent: prioritize the matched child (it already carries
-                # table header + relevant rows) instead of the whole section.
-                body, covered = hit.chunk.content, list(hit.chunk.block_ids)
+            members = [chunk]
+            if chunk.chunk_type == "text":
+                members = sorted(
+                    [chunk, *(n for n in self.metadata.neighbor_chunks(chunk, retrieval.neighbor_chunks) if n.chunk_id not in seen_chunks)],
+                    key=lambda item: item.ordinal,
+                )
+            body = self._compose_body(chunk, members)
+            covered = list(dict.fromkeys(block_id for member in members for block_id in member.block_ids))
             body_hash = text_sha1(body)
             if body_hash in seen_hashes:
                 continue
@@ -189,27 +200,81 @@ class HybridRetriever:
                 related_ids = []
             used += len(content)
             seen_hashes.add(body_hash)
+            seen_chunks.update(member.chunk_id for member in members)
             seen_blocks.update(covered)
             seen_blocks.update(related_ids)
-            context = {
-                "parent": parent,
-                "hit": hit,
-                "hits": [hit],
-                "content": sanitize_context(content),
-                "block_ids": covered,
-                "related_block_ids": related_ids,
-                "citation": build_citation(hit),
-                "asset_paths": [self._resolve_artifact_path(hit.chunk.asset_path)] if hit.chunk.asset_path else [],
-                "order": (parent.source_file, parent.metadata.get("reading_order", 0)),
-            }
-            by_parent[parent.parent_id] = context
-            contexts.append(context)
+            profile = self.metadata.document_profile(chunk.document_id)
+            pages = sorted({p for member in members for p in (member.page_start, member.page_end) if p is not None})
+            contexts.append(
+                {
+                    "chunk": chunk,
+                    "hit": hit,
+                    "hits": [hit],
+                    "content": sanitize_context(content),
+                    "block_ids": covered,
+                    "related_block_ids": related_ids,
+                    "citation": build_citation(hit, pages),
+                    "asset_paths": [self._resolve_artifact_path(chunk.asset_path)] if chunk.asset_path else [],
+                    "table_file": self._resolve_artifact_path(chunk.metadata["table_file"])
+                    if chunk.metadata.get("table_file")
+                    else None,
+                    "info": {
+                        "source_file": chunk.source_file,
+                        "pages": pages,
+                        "section_path": chunk.section_path,
+                        # Profile text comes from the document itself: treat it as data.
+                        "title": sanitize_context(profile["title"]) if profile.get("title") else None,
+                        "doc_number": profile.get("doc_number"),
+                        "issue_date": profile.get("issue_date"),
+                        "signers": [sanitize_context(name) for name in profile.get("signers") or []],
+                    },
+                    "order": (chunk.source_file, chunk.document_id, chunk.ordinal),
+                }
+            )
 
         # Sort by document and reading order, then assign backend source IDs.
         contexts.sort(key=lambda item: item["order"])
         for index, context in enumerate(contexts, start=1):
             context["source_id"] = f"SOURCE_{index}"
         return contexts
+
+    def _compose_body(self, chunk: Chunk, members: list[Chunk]) -> str:
+        if chunk.metadata.get("table_truncated"):
+            full = self._full_table_text(chunk)
+            if full:
+                return full
+        if len(members) == 1:
+            return chunk.content
+        parts = []
+        for member in members:
+            parts.append(member.content if member.chunk_id == chunk.chunk_id and not parts else _strip_header(member.content))
+        return "\n\n".join(parts)
+
+    def _full_table_text(self, chunk: Chunk) -> str | None:
+        """Render a preview-only table in full, up to ``max_table_chars_in_context``."""
+        block = self.metadata.get_block(chunk.block_ids[0])
+        rows = (block.metadata.get("rows") if block else None) or []
+        if not rows:
+            return None
+        inherited = block.metadata.get("inherited_header")
+        table_rows = ([list(inherited)] + rows) if inherited else rows
+        limit = self.config.retrieval.max_table_chars_in_context
+        shown = 1
+        while shown < len(table_rows) and len(rows_to_markdown(table_rows[: shown + 1])) <= limit:
+            shown += 1
+        lines = []
+        header = chunk.content.split("\n\n", 1)[0] if chunk.content.startswith(("Section:", "Sheet:", "Range:")) else ""
+        if header:
+            lines.append(header)
+        if block.metadata.get("caption"):
+            lines.append(f"Table title: {block.metadata['caption']}")
+        lines.append(rows_to_markdown(table_rows[:shown]))
+        if shown < len(table_rows):
+            lines.append(
+                f"[... {len(table_rows) - shown} hàng còn lại không hiển thị; "
+                f"bảng đầy đủ: {chunk.metadata.get('table_file')}]"
+            )
+        return "\n".join(lines)
 
     def _resolve_artifact_path(self, value: str) -> str:
         path = Path(value)
@@ -250,7 +315,14 @@ def render_related_block(block: Block, relation_type: str, limit: int = 1500) ->
     return f"{header}\n{content}"
 
 
-def build_citation(hit: SearchHit) -> str:
+def _strip_header(content: str) -> str:
+    """Drop the Section/Sheet/Range header of a neighbouring chunk (same section as the hit)."""
+    if content.startswith(("Section:", "Sheet:", "Range:")) and "\n\n" in content:
+        return content.split("\n\n", 1)[1]
+    return content
+
+
+def build_citation(hit: SearchHit, pages: list[int] | None = None) -> str:
     chunk = hit.chunk
     if chunk.sheet_name:
         location = f'sheet "{chunk.sheet_name}"'
@@ -258,12 +330,10 @@ def build_citation(hit: SearchHit) -> str:
             location += f", vùng {chunk.cell_range}"
         return f"[{chunk.source_file}, {location}]"
     if chunk.page_start is not None:
-        pages = (
-            f"trang {chunk.page_start}"
-            if chunk.page_end in (None, chunk.page_start)
-            else f"trang {chunk.page_start}-{chunk.page_end}"
-        )
-        return f"[{chunk.source_file}, {pages}]"
+        first = min(pages) if pages else chunk.page_start
+        last = max(pages) if pages else (chunk.page_end or chunk.page_start)
+        label = f"trang {first}" if first == last else f"trang {first}-{last}"
+        return f"[{chunk.source_file}, {label}]"
     if chunk.section_path:
         return f"[{chunk.source_file}, mục \"{' > '.join(chunk.section_path)}\"]"
     return f"[{chunk.source_file}]"

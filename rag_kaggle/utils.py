@@ -56,6 +56,11 @@ def escape_markdown_cell(value: str) -> str:
     return clean_text(str(value)).replace("|", "\\|").replace("\n", "<br>")
 
 
+def table_xlsx_relpath(document_id: str, block_id: str) -> str:
+    """Corpus-relative path of the full-table workbook for a large table block."""
+    return f"tables/{document_id}/{block_id}.xlsx"
+
+
 def estimate_tokens(text: str, chars_per_token: float = 3.6) -> int:
     return max(1, round(len(text) / chars_per_token)) if text else 0
 

@@ -1,5 +1,11 @@
 # Kiến trúc hệ thống Multimodal RAG
 
+> **Cập nhật:** chiến lược Parent-child trong tài liệu này đã được thay bằng chunking theo cấu trúc
+> (1 chunk = 1 nhóm đoạn / 1 bảng / 1 ảnh; bảng lớn lưu preview + file `.xlsx`), kèm hồ sơ tài liệu
+> (keyword, thực thể, người ký). Các mục 2.3, 2.12, 6 và 9.4 bên dưới mô tả thiết kế cũ; luồng đang chạy
+> được mô tả trong [docs/data-flow.md](./docs/data-flow.md).
+
+
 ## 1. Tổng quan
 
 ### 1.0. Trạng thái implementation hiện tại
@@ -95,7 +101,7 @@ thị giác, không đọc lại toàn bộ tài liệu.
 
 ### 2.3. Parent-child chunking hoạt động ra sao?
 
-![Minh họa Parent-child chunking](./docs/diagrams/03-parent-child.png)
+![Minh họa Structure-aware chunking](./docs/diagrams/03-structure-aware.png)
 
 Child nhỏ để tìm đúng. Parent lớn hơn để trả lời không mất ngữ cảnh. Hệ thống
 không đưa toàn bộ parent vào prompt nếu các phần còn lại không liên quan.

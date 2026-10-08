@@ -5,7 +5,7 @@ Pipeline được tách thành hai session độc lập:
 ```text
 01_ingestion.ipynb
 PDF / DOCX / Excel / ZIP / folder
--> parse + OCR/VLM -> parent-child chunking -> embedding
+-> parse + OCR/VLM -> structure-aware chunking -> embedding
 -> Qdrant + BM25 + metadata/assets
 -> frozen corpus_bundle.zip
 
@@ -78,7 +78,7 @@ corpus_bundle.zip
 └── parsed/
 ```
 
-Qdrant là vector store chính nhưng không thay thế metadata, bảng gốc và assets dùng để mở rộng parent,
+Qdrant là vector store chính nhưng không thay thế metadata, bảng gốc và assets dùng để mở rộng ngữ cảnh,
 tính toán và render citation. Source PDF/DOCX/Excel không được đưa vào bundle mặc định; bật
 `config.artifacts.include_source_documents` nếu cần giữ bản gốc.
 
@@ -156,3 +156,5 @@ python -m unittest discover -s tests
 ```
 
 Thiết kế chi tiết nằm trong [Architecture.md](Architecture.md).
+
+Luồng xử lý dữ liệu thực tế từng bước: [docs/data-flow.md](docs/data-flow.md).

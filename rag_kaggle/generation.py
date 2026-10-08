@@ -117,15 +117,23 @@ class LocalQwen:
         source_map: dict[str, str] = {}
         current_chars = 0
         for item in [*(computed or []), *contexts]:
-            parent = item.get("parent")
+            info = item.get("info")
             lines = [f"[{item['source_id']}]"]
-            if parent is not None:
-                lines.append(f"file: {parent.source_file}")
-                pages = parent.metadata.get("pages") or []
-                if pages:
-                    lines.append(f"page: {', '.join(map(str, pages[:5]))}")
-                if parent.section_path:
-                    lines.append(f"section: {' > '.join(parent.section_path)}")
+            if info is not None:
+                lines.append(f"file: {info['source_file']}")
+                if info.get("title"):
+                    lines.append(f"document: {info['title']}")
+                meta = [f"số hiệu {info['doc_number']}" if info.get("doc_number") else "",
+                        f"ngày {info['issue_date']}" if info.get("issue_date") else "",
+                        "người ký: " + ", ".join(info["signers"]) if info.get("signers") else ""]
+                if any(meta):
+                    lines.append("document metadata: " + "; ".join(part for part in meta if part))
+                if info.get("pages"):
+                    lines.append(f"page: {', '.join(map(str, info['pages'][:5]))}")
+                if info.get("section_path"):
+                    lines.append(f"section: {' > '.join(info['section_path'])}")
+            if item.get("table_file"):
+                lines.append(f"full table file: {item['table_file']}")
             lines.append(f"content:\n{item['content']}")
             block = "\n".join(lines)
             if current_chars + len(block) > self.config.generation.max_context_chars:

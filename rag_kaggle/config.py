@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 
-PARSER_VERSION = "0.3.0"
-CHUNKER_VERSION = "0.2.0"
-ARTIFACT_SCHEMA_VERSION = 1
+PARSER_VERSION = "0.4.0"
+CHUNKER_VERSION = "1.0.0-structure-aware"
+ARTIFACT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -61,6 +61,14 @@ class OCRCorrectionConfig:
     fail_open: bool = True
     correct_labels: tuple[str, ...] = ("doc_title", "paragraph_title", "text", "caption")
     correct_tables: bool = False
+    # Context budget: the prompt carries system + skill + (glossary) + the tail of the
+    # previous corrected text + one segment of the current component, nothing else.
+    previous_context_chars: int = 600
+    segment_chars: int = 1200
+    # Rolling per-document list of canonical names. Off by default: enable only after
+    # benchmarking that the correction model follows it.
+    glossary_enabled: bool = False
+    glossary_max_terms: int = 20
 
 
 @dataclass
@@ -73,18 +81,26 @@ class VisionConfig:
     max_retries: int = 2
     min_ocr_chars_for_skip: int = 0
     image_types: tuple[str, ...] = ("flowchart", "chart", "diagram")
+    # Tail of the one preceding page given to the VLM as continuation context.
+    previous_page_chars: int = 1500
     # Set by the Kaggle device planner. None delegates placement to Transformers.
     device: str | None = None
 
 
 @dataclass
 class ChunkingConfig:
-    child_chars: int = 1800
-    child_overlap_chars: int = 240
-    parent_chars: int = 7500
-    table_rows_per_chunk: int = 15
-    table_max_columns_per_chunk: int = 8
-    table_key_columns: int = 1
+    """Structure-aware chunking: a chunk is one text unit, one table or one image."""
+
+    # Consecutive paragraphs of one section are merged up to this size; a single
+    # paragraph is only split (at sentence boundaries) when it alone exceeds it.
+    text_chunk_chars: int = 1800
+    # Tables stay whole as markdown up to this size. Larger tables are indexed as a
+    # preview (caption, header, first rows/columns) and stored in full as an .xlsx file.
+    table_inline_max_chars: int = 6000
+    table_preview_rows: int = 5
+    table_preview_columns: int = 5
+    # An image chunk (OCR text + caption + references) is split only above this size.
+    visual_max_chars: int = 6000
     chars_per_token: float = 3.6
 
 
@@ -112,7 +128,12 @@ class RetrievalConfig:
     reranker_device: str = "cuda"
     expand_relationships: bool = True
     max_related_blocks: int = 6
-    max_parent_chars_in_context: int = 6000
+    # Adjacent text chunks of the same section added around a retrieved text chunk.
+    neighbor_chunks: int = 1
+    # Budget for expanding a preview-only table to its full rows in the answer context.
+    max_table_chars_in_context: int = 12000
+    # Documents that mention an entity found in the query get an extra RRF ranking.
+    entity_boost: bool = True
 
 
 @dataclass

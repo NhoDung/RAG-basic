@@ -33,7 +33,11 @@ ocr_correction:
   max_retries: 1
   fail_open: true
   correct_labels: [doc_title, paragraph_title, text, caption]
-  correct_tables: false
+  correct_tables: false          # true: sửa theo từng ô, giữ nguyên số hàng/ô, ghi ngược vào rows
+  previous_context_chars: 600    # đuôi đoạn liền trước (đã sửa) đưa vào prompt
+  segment_chars: 1200            # đoạn dài được sửa theo từng khúc <= giá trị này
+  glossary_enabled: false        # danh sách tên chuẩn hoá của document; bật sau khi benchmark
+  glossary_max_terms: 20
 
 vision:
   enabled: false               # Bật khi evaluation cho thấy cần hiểu flowchart/dashboard
@@ -44,12 +48,11 @@ vision:
   device: null                   # Notebook tự chọn GPU 0 khi T4 x2
 
 chunking:
-  child_chars: 1800            # ~450 tokens
-  child_overlap_chars: 240     # ~60 tokens
-  parent_chars: 7500           # ~2000 tokens
-  table_rows_per_chunk: 15
-  table_max_columns_per_chunk: 8
-  table_key_columns: 1
+  text_chunk_chars: 1800       # ~450 tokens; đoạn cùng mục được gộp, không overlap
+  table_inline_max_chars: 6000 # bảng nhỏ hơn: 1 chunk markdown đầy đủ
+  table_preview_rows: 5        # bảng lớn: chỉ index preview, bảng đầy đủ lưu .xlsx
+  table_preview_columns: 5
+  visual_max_chars: 6000       # 1 ảnh = 1 chunk
 
 retrieval:
   # Mục tiêu kiến trúc là BAAI/bge-multilingual-gemma2 (cần query instruction),
@@ -67,6 +70,9 @@ retrieval:
   reranker_model: BAAI/bge-reranker-v2-m3
   reranker_device: cuda          # Notebook đổi thành CPU khi T4 x2
   expand_relationships: true
+  neighbor_chunks: 1
+  max_table_chars_in_context: 12000
+  entity_boost: true
 
 generation:
   model: Qwen/Qwen2.5-7B-Instruct

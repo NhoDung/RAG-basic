@@ -72,7 +72,7 @@ def configure_ingestion_devices(config: PipelineConfig, gpu_count: int | None = 
         config.vision.device = "cuda:0"
         return {
             "mode": "ingestion_dual_gpu",
-            "gpu_0": ["OCR correction LLM", "dense embedding (after correction)", "optional vision model (exclusive)"],
+            "gpu_0": ["OCR correction LLM", "optional vision model (after correction drains)", "dense embedding (after both)"],
             "gpu_1": ["PaddleOCR-VL worker"],
             "cpu": ["parsing", "chunking", "Qdrant", "BM25", "metadata"],
         }

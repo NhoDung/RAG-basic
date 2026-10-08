@@ -12,23 +12,34 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import PipelineConfig
-from .models import Block, ChildChunk, ParentContext, ParsedDocument, Relationship, StageStatus
+from .models import Block, Chunk, ParsedDocument, Relationship, StageStatus
+from .entities import strip_diacritics
+from .profile import entity_keys, normalize_key
 from .utils import text_sha1
 
 
 LOGGER = logging.getLogger(__name__)
 DENSE_VECTOR_NAME = "dense"
-FILTER_FIELDS = ("document_id", "chunk_type", "source_file", "sheet_name")
+FILTER_FIELDS = ("document_id", "chunk_type", "source_file", "sheet_name", "entities")
 
 
 class MetadataStore:
-    """SQLite structured storage: documents, blocks, parents, chunks, graph, status."""
+    """SQLite structured storage: documents, blocks, chunks, entities, graph, status."""
 
     def __init__(self, path: Path):
         self.path = path
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._reject_legacy_schema()
         self._create_schema()
+
+    def _reject_legacy_schema(self) -> None:
+        columns = [row[1] for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()]
+        if columns and "parent_id" in columns:
+            raise RuntimeError(
+                "metadata.db uses the legacy parent-child schema (artifact schema v1). "
+                "Re-ingest the documents into a new work_dir to build a structure-aware corpus."
+            )
 
     def _create_schema(self):
         self.connection.executescript(
@@ -47,18 +58,28 @@ class MetadataStore:
                 content TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS parents (
-                parent_id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                section_key TEXT NOT NULL,
                 content TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS chunks (
-                chunk_id TEXT PRIMARY KEY,
-                parent_id TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS document_entities (
                 document_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                payload_json TEXT NOT NULL
+                kind TEXT NOT NULL,
+                canonical TEXT NOT NULL,
+                norm_key TEXT NOT NULL,
+                aliases_json TEXT NOT NULL,
+                mentions INTEGER NOT NULL,
+                PRIMARY KEY (document_id, norm_key)
+            );
+            CREATE TABLE IF NOT EXISTS document_keywords (
+                document_id TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                norm_key TEXT NOT NULL,
+                PRIMARY KEY (document_id, norm_key)
             );
             CREATE TABLE IF NOT EXISTS relationships (
                 source_id TEXT NOT NULL,
@@ -91,9 +112,9 @@ class MetadataStore:
                 value TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_document ON blocks(document_id);
-            CREATE INDEX IF NOT EXISTS idx_parents_document ON parents(document_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_entities_key ON document_entities(norm_key);
+            CREATE INDEX IF NOT EXISTS idx_keywords_key ON document_keywords(norm_key);
             CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_id);
             CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_file);
             """
@@ -105,8 +126,7 @@ class MetadataStore:
     def upsert_document(
         self,
         document: ParsedDocument,
-        parents: list[ParentContext],
-        chunks: list[ChildChunk],
+        chunks: list[Chunk],
     ) -> None:
         """Replace everything stored for ``document_id`` atomically."""
         with self.connection:
@@ -137,23 +157,33 @@ class MetadataStore:
                 ],
             )
             self.connection.executemany(
-                "INSERT OR REPLACE INTO parents VALUES (?, ?, ?, ?)",
-                [
-                    (parent.parent_id, parent.document_id, parent.content, json.dumps(parent.to_dict(), ensure_ascii=False))
-                    for parent in parents
-                ],
-            )
-            self.connection.executemany(
-                "INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
                 [
                     (
                         chunk.chunk_id,
-                        chunk.parent_id,
                         chunk.document_id,
+                        chunk.ordinal,
+                        chunk.section_key,
                         chunk.content,
                         json.dumps(chunk.to_dict(), ensure_ascii=False, default=str),
                     )
                     for chunk in chunks
+                ],
+            )
+            profile = document.metadata.get("profile") or {}
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO document_entities VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (document.document_id, kind, canonical, key, json.dumps(aliases, ensure_ascii=False), mentions)
+                    for kind, canonical, key, aliases, mentions in entity_keys(profile)
+                ],
+            )
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO document_keywords VALUES (?, ?, ?)",
+                [
+                    (document.document_id, keyword, normalize_key(keyword))
+                    for keyword in dict.fromkeys(profile.get("keywords") or [])
+                    if normalize_key(keyword)
                 ],
             )
             self.connection.executemany(
@@ -175,7 +205,7 @@ class MetadataStore:
             self._delete_document_rows(document_id)
 
     def _delete_document_rows(self, document_id: str) -> None:
-        for table in ("chunks", "parents", "blocks", "relationships", "documents"):
+        for table in ("chunks", "document_entities", "document_keywords", "blocks", "relationships", "documents"):
             self.connection.execute(f"DELETE FROM {table} WHERE document_id = ?", (document_id,))
 
     def reset(self) -> None:
@@ -183,7 +213,8 @@ class MetadataStore:
             self.connection.executescript(
                 """
                 DELETE FROM chunks;
-                DELETE FROM parents;
+                DELETE FROM document_entities;
+                DELETE FROM document_keywords;
                 DELETE FROM blocks;
                 DELETE FROM relationships;
                 DELETE FROM documents;
@@ -269,17 +300,38 @@ class MetadataStore:
             return [row[0] for row in rows if row[0]]
         raise ValueError(field)
 
-    def get_parent(self, parent_id: str) -> ParentContext | None:
-        row = self.connection.execute(
-            "SELECT payload_json FROM parents WHERE parent_id = ?", (parent_id,)
-        ).fetchone()
-        return ParentContext(**json.loads(row[0])) if row else None
-
-    def get_chunk(self, chunk_id: str) -> ChildChunk | None:
+    def get_chunk(self, chunk_id: str) -> Chunk | None:
         row = self.connection.execute(
             "SELECT payload_json FROM chunks WHERE chunk_id = ?", (chunk_id,)
         ).fetchone()
-        return ChildChunk(**json.loads(row[0])) if row else None
+        return Chunk(**json.loads(row[0])) if row else None
+
+    def neighbor_chunks(self, chunk: Chunk, window: int = 1) -> list[Chunk]:
+        """Text chunks of the same section within ``window`` positions of ``chunk``."""
+        if window <= 0:
+            return []
+        rows = self.connection.execute(
+            """SELECT payload_json FROM chunks
+               WHERE document_id = ? AND section_key = ? AND ordinal != ?
+                 AND ordinal BETWEEN ? AND ?
+               ORDER BY ordinal""",
+            (chunk.document_id, chunk.section_key, chunk.ordinal, chunk.ordinal - window, chunk.ordinal + window),
+        ).fetchall()
+        return [c for c in (Chunk(**json.loads(row[0])) for row in rows) if c.chunk_type == "text"]
+
+    def document_profile(self, document_id: str) -> dict:
+        payload = self.get_document(document_id) or {}
+        return (payload.get("metadata") or {}).get("profile") or {}
+
+    def match_entities(self, query: str) -> list[dict]:
+        """Entities of any document that the query mentions (diacritic- and OCR-variant-insensitive)."""
+        haystack = f" {normalize_key(query)} "
+        if len(haystack) < 5:
+            return []
+        rows = self.connection.execute(
+            "SELECT document_id, kind, canonical, norm_key FROM document_entities"
+        ).fetchall()
+        return [dict(row) for row in rows if f" {row['norm_key']} " in haystack]
 
     def get_block(self, block_id: str) -> Block | None:
         row = self.connection.execute(
@@ -314,9 +366,9 @@ class MetadataStore:
             for row in rows
         ]
 
-    def list_chunks(self) -> list[ChildChunk]:
+    def list_chunks(self) -> list[Chunk]:
         rows = self.connection.execute("SELECT payload_json FROM chunks ORDER BY rowid").fetchall()
-        return [ChildChunk(**json.loads(row[0])) for row in rows]
+        return [Chunk(**json.loads(row[0])) for row in rows]
 
     def chunk_ids_for_document(self, document_id: str) -> list[str]:
         rows = self.connection.execute("SELECT chunk_id FROM chunks WHERE document_id = ?", (document_id,)).fetchall()
@@ -335,7 +387,7 @@ class MetadataStore:
 
     def stats(self) -> dict[str, int]:
         result = {}
-        for table in ("documents", "blocks", "parents", "chunks", "relationships"):
+        for table in ("documents", "blocks", "chunks", "relationships"):
             result[table] = self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return result
 
@@ -471,7 +523,7 @@ class HybridIndex:
 
     def build(
         self,
-        chunks: list[ChildChunk],
+        chunks: list[Chunk],
         reset: bool = True,
         removed_document_ids: list[str] | None = None,
         progress: Callable[[str], None] | None = None,
@@ -610,7 +662,7 @@ class HybridIndex:
             except Exception:
                 pass
 
-    def _build_bm25(self, chunks: list[ChildChunk]):
+    def _build_bm25(self, chunks: list[Chunk]):
         if not chunks:
             self.bm25, self.bm25_chunk_ids, self.bm25_fields = None, [], []
             if self.config.bm25_path.exists():
@@ -620,7 +672,7 @@ class HybridIndex:
 
         self.bm25_chunk_ids = [chunk.chunk_id for chunk in chunks]
         self.bm25_fields = [{field: getattr(chunk, field) for field in FILTER_FIELDS} for chunk in chunks]
-        self.bm25 = BM25Okapi([tokenize_vi(chunk.content) for chunk in chunks])
+        self.bm25 = BM25Okapi([tokenize_vi(bm25_text(chunk)) for chunk in chunks])
         with self.config.bm25_path.open("wb") as stream:
             pickle.dump({"ids": self.bm25_chunk_ids, "fields": self.bm25_fields, "index": self.bm25}, stream)
 
@@ -639,9 +691,24 @@ def _matches_filters(fields: dict[str, Any], filters: dict[str, Any]) -> bool:
         if expected in (None, "", []):
             continue
         values = expected if isinstance(expected, (list, tuple, set)) else [expected]
-        if fields.get(key) not in values:
+        actual = fields.get(key)
+        if isinstance(actual, (list, tuple, set)):  # Array payload field, e.g. entities.
+            if not any(item in values for item in actual):
+                return False
+        elif actual not in values:
             return False
     return True
+
+
+def bm25_text(chunk: Chunk) -> str:
+    """Sparse-index text: the chunk plus file name, document title, entities and keywords.
+
+    Entities are repeated without diacritics so OCR-stripped spellings still match.
+    """
+    profile = chunk.metadata.get("profile") or {}
+    extras = [chunk.source_file, profile.get("title") or "", *chunk.entities, *chunk.keywords]
+    extras.extend(strip_diacritics(entity) for entity in chunk.entities)
+    return "\n".join([chunk.content, *[item for item in extras if item]])
 
 
 def build_qdrant_filter(filters: dict[str, Any] | None):

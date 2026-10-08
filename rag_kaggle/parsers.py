@@ -7,6 +7,7 @@ import re
 import time
 import zipfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 from xml.etree import ElementTree
@@ -14,7 +15,7 @@ from xml.etree import ElementTree
 from .config import PARSER_VERSION, PipelineConfig
 from .ingestion import IngestionError, convert_with_libreoffice, find_libreoffice
 from .models import Block, ParsedDocument
-from .ocr_correction import OCRCorrectionCoordinator
+from .ocr_correction import OCRCorrectionCoordinator, tail_context
 from .paddleocr_vl import PaddleOCRVLAdapter
 from .utils import (
     clean_text,
@@ -62,6 +63,20 @@ R_EMBED = f"{{{DRAWING_NS['r']}}}embed"
 R_ID = f"{{{DRAWING_NS['r']}}}id"
 
 
+@dataclass
+class PendingVisual:
+    """A chart/flowchart whose VLM description runs after OCR correction has drained."""
+
+    block: Block
+    image_path: Path
+    image_type: str
+    caption: str
+    section_path: list[str]
+    location: str
+    ordinal: str
+    drop_if_empty: bool
+
+
 class DocumentParser:
     def __init__(
         self,
@@ -76,6 +91,7 @@ class DocumentParser:
         self.ocr_correction = ocr_correction
         self._progress: Callable[[str], None] | None = None
         self._active_correction_document_id: str | None = None
+        self._deferred_vision: list[PendingVisual] = []
 
     def parse(
         self,
@@ -87,6 +103,7 @@ class DocumentParser:
         extension = source.suffix.lower()
         previous_progress, self._progress = self._progress, progress
         document: ParsedDocument | None = None
+        self._deferred_vision = []
         try:
             if extension == ".pdf":
                 document = self._parse_pdf(source)
@@ -99,12 +116,14 @@ class DocumentParser:
             else:
                 raise IngestionError("unsupported_type", f"Unsupported file type: {extension}")
             self._finish_ocr_correction(document)
+            self._run_deferred_vision(document)
         except Exception:
             if self.ocr_correction is not None and self._active_correction_document_id is not None:
                 self.ocr_correction.abort_document(self._active_correction_document_id)
             raise
         finally:
             self._active_correction_document_id = None
+            self._deferred_vision = []
             self._progress = previous_progress
         if display_name:
             document.source_file = display_name
@@ -169,12 +188,38 @@ class DocumentParser:
             return
         stats = self.ocr_correction.finish_document(document.document_id)
         document.metadata["ocr_correction"] = stats
+        self._apply_corrected_headings(document)
         if stats.get("fallback_count"):
             self._warn(
                 document,
                 "ocr_correction",
                 f"OCR correction used raw-text fallback for {stats['fallback_count']} component(s)",
             )
+
+    @staticmethod
+    def _heading_text(content: str) -> str:
+        return clean_text(re.sub(r"^#+\s*", "", content))
+
+    def _apply_corrected_headings(self, document: ParsedDocument) -> None:
+        """Rewrite section_path entries that still hold a heading's uncorrected OCR text.
+
+        Scanned pages derive ``section_path`` while parsing, before the asynchronous
+        correction has run, so descendants would otherwise keep the misspelled heading.
+        """
+        replacements: dict[str, str] = {}
+        for block in document.blocks:
+            correction = block.metadata.get("ocr_correction") or {}
+            raw = block.metadata.get("ocr_text_raw")
+            if block.block_type != "heading" or correction.get("status") != "success" or raw is None:
+                continue
+            before, after = self._heading_text(raw), self._heading_text(block.content)
+            if before and after and before != after:
+                replacements[before] = after
+        if not replacements:
+            return
+        for block in document.blocks:
+            block.section_path = [replacements.get(part, part) for part in block.section_path]
+        document.metadata["corrected_headings"] = replacements
 
     def _submit_ocr_correction(self, block: Block, label: str) -> None:
         if self.ocr_correction is None or not self.config.ocr_correction.enabled:
@@ -245,20 +290,16 @@ class DocumentParser:
         metadata = kwargs.pop("metadata", {})
         metadata.update({"ocr": ocr_result["raw"], "image_type": image_type})
 
-        vlm_result = {"status": "skipped", "output": None}
-        if self.vision is not None and image_type in ("flowchart", "chart"):
-            with self._timed_unit(document, "vlm", location, asset=str(image_path), image_type=image_type):
-                vlm_result = self.vision.describe(
-                    image_path,
-                    image_type,
-                    ocr_text=ocr_result["text"],
-                    caption=caption,
-                    section=" > ".join(section_path),
-                )
-            if vlm_result["status"] not in ("success", "skipped"):
-                self._warn(document, "vlm", f"VLM {vlm_result['status']} for {image_path.name}")
-
-        if not ocr_result["text"] and vlm_result["output"] is None:
+        # The VLM runs after the document's OCR correction has drained, so it sees the
+        # corrected OCR text and the corrected end of the previous page, and never shares
+        # the GPU with the correction model.
+        defer_vlm = (
+            self.vision is not None
+            and self.vision.enabled
+            and image_type in ("flowchart", "chart")
+            and image_type in self.config.vision.image_types
+        )
+        if not ocr_result["text"] and not defer_vlm:
             return None
         image_block = document.add_block(
             self._block(
@@ -273,25 +314,74 @@ class DocumentParser:
                 **kwargs,
             )
         )
-        self._submit_ocr_correction(image_block, "text")
-        if vlm_result["output"] is not None:
-            document.add_block(
-                self._block(
-                    document,
-                    image_type,
-                    render_vlm_output(vlm_result["output"]),
-                    f"{ordinal}-vlm",
-                    section_path=list(section_path),
-                    asset_path=self._artifact_ref(image_path),
-                    metadata={"derived_from": image_block.block_id, "vlm_model": self.config.vision.model},
-                    raw_content=vlm_result["output"],
-                    page=kwargs.get("page"),
-                    sheet_name=kwargs.get("sheet_name"),
+        if ocr_result["text"]:
+            self._submit_ocr_correction(image_block, "text")
+        if defer_vlm:
+            self._deferred_vision.append(
+                PendingVisual(
+                    image_block, image_path, image_type, caption, list(section_path), location, ordinal,
+                    drop_if_empty=not ocr_result["text"],
                 )
             )
-        elif vlm_result["status"] == "needs_review":
-            image_block.metadata["vlm_status"] = "needs_review"
         return image_block
+
+    def _run_deferred_vision(self, document: ParsedDocument) -> None:
+        pending, self._deferred_vision = self._deferred_vision, []
+        if not pending or self.vision is None:
+            return
+        if self.ocr_correction is not None:
+            self.ocr_correction.unload()  # Free the correction model's VRAM before the VLM loads.
+        for item in pending:
+            block = item.block
+            ocr_text = "" if item.drop_if_empty else block.content
+            with self._timed_unit(
+                document, "vlm", item.location, asset=str(item.image_path), image_type=item.image_type
+            ):
+                result = self.vision.describe(
+                    item.image_path,
+                    item.image_type,
+                    ocr_text=ocr_text,
+                    caption=item.caption,
+                    section=" > ".join(item.section_path),
+                    previous_context=self._previous_page_text(document, block.page),
+                )
+            if result["status"] not in ("success", "skipped"):
+                self._warn(document, "vlm", f"VLM {result['status']} for {item.image_path.name}")
+            if result["output"] is not None:
+                derived = self._block(
+                    document,
+                    item.image_type,
+                    render_vlm_output(result["output"]),
+                    f"{item.ordinal}-vlm",
+                    section_path=list(item.section_path),
+                    asset_path=self._artifact_ref(item.image_path),
+                    metadata={"derived_from": block.block_id, "vlm_model": self.config.vision.model},
+                    raw_content=result["output"],
+                    page=block.page,
+                    sheet_name=block.sheet_name,
+                )
+                document.blocks.insert(self._block_index(document, block) + 1, derived)
+            elif item.drop_if_empty:
+                document.blocks.remove(block)  # Nothing to index: no OCR text and no description.
+            elif result["status"] == "needs_review":
+                block.metadata["vlm_status"] = "needs_review"
+        for order, block in enumerate(document.blocks):
+            block.reading_order = order
+
+    @staticmethod
+    def _block_index(document: ParsedDocument, block: Block) -> int:
+        return next(index for index, candidate in enumerate(document.blocks) if candidate is block)
+
+    def _previous_page_text(self, document: ParsedDocument, page: int | None) -> str:
+        """End of the single preceding page (corrected text); never accumulates older pages."""
+        if page is None:
+            return ""
+        parts = [
+            block.content
+            for block in document.blocks
+            if block.page == page - 1 and block.block_type in ("text", "ocr_page", "caption", "heading")
+        ]
+        return tail_context("\n".join(parts), self.config.vision.previous_page_chars)
 
     def _run_ocr(self, document: ParsedDocument, image_path: Path, unit: str | None = None) -> dict:
         if not self.config.parsing.enable_ocr or self.ocr is None:
@@ -1316,3 +1406,44 @@ def _unique_headers(header: list[str]) -> list[str]:
             seen[name] = 0
         result.append(name)
     return result
+
+
+def save_table_workbooks(document: ParsedDocument, chunks: list, work_dir: Path) -> int:
+    """Write every table that was indexed as a preview to a full .xlsx next to the corpus."""
+    targets = {
+        chunk.block_ids[0]: chunk.metadata["table_file"]
+        for chunk in chunks
+        if chunk.metadata.get("table_file") and chunk.block_ids
+    }
+    if not targets:
+        return 0
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        LOGGER.warning("openpyxl missing; large tables of %s were not saved as .xlsx", document.source_file)
+        document.metadata.setdefault("warnings", []).append(
+            {"stage": "table_export", "message": "openpyxl missing; large tables were not saved as .xlsx"}
+        )
+        return 0
+    written = 0
+    for block in document.blocks:
+        relative = targets.get(block.block_id)
+        rows = block.metadata.get("rows")
+        if relative is None or not rows:
+            continue
+        inherited = block.metadata.get("inherited_header")
+        path = Path(work_dir) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = re.sub(r"[\[\]:*?/\\]", "_", block.sheet_name or "Table")[:31]
+        all_rows = ([list(inherited)] if inherited else []) + [list(row) for row in rows]
+        for row_index, row in enumerate(all_rows, start=1):
+            for column_index, value in enumerate(row, start=1):
+                text = "" if value is None else str(value)
+                cell = sheet.cell(row=row_index, column=column_index, value=text)
+                if text.startswith("="):  # Document text must never be evaluated as a formula.
+                    cell.data_type = "s"
+        workbook.save(path)
+        written += 1
+    return written

@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
-from .chunking import ParentChildChunker
+from .chunking import StructureAwareChunker
 from .computation import compute_from_blocks
 from .config import ARTIFACT_SCHEMA_VERSION, CHUNKER_VERSION, PARSER_VERSION, PipelineConfig
 from .generation import LocalQwen
@@ -28,7 +28,8 @@ from .ingestion import IngestionError, discover_input_files, validate_file
 from .models import StageStatus
 from .ocr_correction import OCRCorrectionCoordinator, PROMPT_VERSION
 from .paddleocr_vl import PaddleOCRVLAdapter
-from .parsers import DocumentParser, save_parsed_document, save_table_parquet
+from .parsers import DocumentParser, save_parsed_document, save_table_parquet, save_table_workbooks
+from .profile import attach_profile_to_chunks, build_document_profile
 from .relationships import build_relationships
 from .retrieval import HybridRetriever, Reranker
 from .storage import DenseEncoder, HybridIndex, MetadataStore
@@ -59,10 +60,6 @@ class RAGPipeline:
         self.mode = mode
         self.config.create_directories()
         if mode in ("full", "ingestion"):
-            if self.config.ocr_correction.enabled and self.config.vision.enabled:
-                raise ValueError(
-                    "OCR correction and optional VLM cannot share cuda:0 in one parse pass; disable one of them."
-                )
             self.ocr = PaddleOCRVLAdapter(
                 model_name=self.config.parsing.ocr_model_name,
                 model_dir=self.config.parsing.ocr_model_dir,
@@ -75,7 +72,7 @@ class RAGPipeline:
                 OCRCorrectionCoordinator(self.config) if self.config.ocr_correction.enabled else None
             )
             self.parser = DocumentParser(self.config, self.ocr, self.vision, self.ocr_correction)
-            self.chunker = ParentChildChunker(self.config.chunking)
+            self.chunker = StructureAwareChunker(self.config.chunking)
         else:
             self.ocr = self.vision = self.parser = self.chunker = self.ocr_correction = None
         if mode in ("full", "retrieval"):
@@ -255,23 +252,30 @@ class RAGPipeline:
 
                 stage_started = time.perf_counter()
                 build_relationships(document)
-                parents, chunks = self.chunker.chunk(document)
+                document.metadata["profile"] = build_document_profile(document)
+                chunks = self.chunker.chunk(document)
+                attach_profile_to_chunks(chunks, document.metadata["profile"])
                 version_metadata = {
                     "original_file_name": name,
                     "uploaded_at": uploaded_at,
                     "content_hash": content_hash,
                 }
-                for parent in parents:
-                    parent.metadata.update(version_metadata)
                 for chunk in chunks:
                     chunk.metadata.update(version_metadata)
                 if self.config.parsing.write_table_parquet:
                     save_table_parquet(document, self.config.table_dir)
+                workbook_count = save_table_workbooks(document, chunks, self.config.work_dir)
+                if workbook_count:
+                    notify(f"Saved {workbook_count} large table(s) as .xlsx for {name}.")
                 save_parsed_document(document, self.config.parsed_dir)
-                self.metadata.upsert_document(document, parents, chunks)
+                self.metadata.upsert_document(document, chunks)
+                profile = document.metadata["profile"]
                 record("chunk", "success" if chunks else "failed", name, document.document_id,
                        error_code=None if chunks else "no_chunks",
-                       message=f"{len(parents)} parents, {len(chunks)} chunks, {len(document.relationships)} relationships",
+                       message=(
+                           f"{len(chunks)} chunks, {len(document.relationships)} relationships, "
+                           f"{len(profile['entities'])} entities, {len(profile['keywords'])} keywords"
+                       ),
                        started=stage_started)
                 new_chunks.extend(chunks)
                 report["documents"].append(
@@ -280,8 +284,12 @@ class RAGPipeline:
                         "document_id": document.document_id,
                         "blocks": len(document.blocks),
                         "relationships": len(document.relationships),
-                        "parents": len(parents),
                         "chunks": len(chunks),
+                        "profile": {
+                            key: profile.get(key)
+                            for key in ("title", "doc_number", "issue_date", "issuer", "signers", "keywords")
+                        },
+                        "entities": len(profile["entities"]),
                         "warnings": warnings,
                         "ocr_correction": document.metadata.get("ocr_correction"),
                         "has_macros": facts.get("has_macros", False),
@@ -388,9 +396,15 @@ class RAGPipeline:
         trace.set("query_plan", plan.to_dict())
         trace.set("filters", applied_filters)
 
+        entity_matches = self.metadata.match_entities(query) if self.config.retrieval.entity_boost else []
+        trace.set("query_entities", entity_matches)
         with trace.stage("retrieve"):
             hits, stage_trace = self.retriever.retrieve_with_trace(
-                query, plan.semantic_queries, applied_filters, plan.keyword_query
+                query,
+                plan.semantic_queries,
+                applied_filters,
+                plan.keyword_query,
+                boost_document_ids=[match["document_id"] for match in entity_matches],
             )
         trace.set("retrieval", stage_trace)
         hit_rows = [_hit_row(hit) for hit in hits]
@@ -454,6 +468,7 @@ class RAGPipeline:
                         "block_ids": item["block_ids"],
                         "related_block_ids": item["related_block_ids"],
                         "asset_paths": item["asset_paths"],
+                        "table_file": item.get("table_file"),
                         "preview": item["content"][:800],
                     }
                     for item in [*computed, *contexts]
@@ -487,7 +502,7 @@ class RAGPipeline:
         return [
             {
                 "source_id": f"SOURCE_{offset + 1}",
-                "parent": None,
+                "info": None,
                 "content": result.render(),
                 "citation": citation,
                 "block_ids": [result.block_id],
@@ -751,6 +766,7 @@ def _hit_row(hit) -> dict:
         "rrf_score": hit.rrf_score,
         "rerank_score": hit.rerank_score,
         "asset_path": hit.chunk.asset_path,
+        "entities": hit.chunk.entities,
         "preview": hit.chunk.content[:500],
     }
 

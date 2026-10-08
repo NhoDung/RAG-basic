@@ -3,126 +3,89 @@ from __future__ import annotations
 import re
 
 from .config import CHUNKER_VERSION, ChunkingConfig
-from .models import Block, ChildChunk, ParentContext, ParsedDocument
-from .utils import estimate_tokens, excel_column_name, rows_to_markdown, stable_id
+from .models import Block, Chunk, ParsedDocument
+from .utils import estimate_tokens, rows_to_markdown, stable_id, table_xlsx_relpath
 
 
 TEXT_TYPES = {"text", "ocr_page", "caption", "heading"}
 VISUAL_TYPES = {"image", "chart", "flowchart"}
 BULLET_PATTERN = re.compile(r"^\s*([-•*+▪◦●]|\d+[.)]|[a-zđ][.)])\s+", re.IGNORECASE)
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?;:…])\s+(?=[A-ZÀ-Ỹ0-9\"“(])")
+MAX_LISTED_COLUMNS = 40
 
 
-class ParentChildChunker:
+class StructureAwareChunker:
+    """Chunk along the document structure instead of a fixed window.
+
+    One chunk is exactly one of: a run of paragraphs from one section (split only at
+    sentence boundaries when a single paragraph is too large), one whole table, or one
+    image with its caption/OCR text. Tables and images are never cut. A table too large
+    to embed is indexed as a preview and stored in full as an .xlsx file.
+    """
+
     def __init__(self, config: ChunkingConfig):
         self.config = config
 
-    def chunk(self, document: ParsedDocument) -> tuple[list[ParentContext], list[ChildChunk]]:
-        parents = self._build_parents(document)
-        blocks_by_id = {block.block_id: block for block in document.blocks}
-        children: list[ChildChunk] = []
-        for parent in parents:
-            parent_blocks = [blocks_by_id[block_id] for block_id in parent.block_ids]
-            children.extend(self._chunk_parent(document, parent, parent_blocks))
-        return parents, children
+    def chunk(self, document: ParsedDocument) -> list[Chunk]:
+        blocks = sorted(document.blocks, key=lambda item: item.reading_order)
+        sections_with_content = {
+            self._section_key(block) for block in blocks if block.block_type != "heading"
+        }
+        chunks: list[Chunk] = []
+        run: list[Block] = []
+        run_key = None
 
-    # ----------------------------------------------------------------- parents
-
-    def _build_parents(self, document: ParsedDocument) -> list[ParentContext]:
-        parents = []
-        current_blocks: list[Block] = []
-        current_size = 0
-        current_key = None
-
-        for block in sorted(document.blocks, key=lambda item: item.reading_order):
-            key = (
-                tuple(block.section_path),
-                block.sheet_name,
-                block.page if not block.section_path and not block.sheet_name else None,
-            )
-            keep_with_previous = bool(block.metadata.get("derived_from")) and current_blocks
-            should_flush = current_blocks and not keep_with_previous and (
-                key != current_key or current_size + len(block.content) > self.config.parent_chars
-            )
-            if should_flush:
-                parents.append(self._make_parent(document, current_blocks, len(parents)))
-                current_blocks = []
-                current_size = 0
-            current_key = key
-            current_blocks.append(block)
-            current_size += len(block.content)
-
-        if current_blocks:
-            parents.append(self._make_parent(document, current_blocks, len(parents)))
-        return parents
-
-    def _make_parent(self, document, blocks, ordinal):
-        section_path = next((block.section_path for block in blocks if block.section_path), [])
-        labels = [
-            f"Document: {document.source_file}",
-            f"Section: {' > '.join(section_path)}" if section_path else "",
-        ]
-        content_parts = [label for label in labels if label]
-        content_parts.extend(f"[{block.block_type.upper()}]\n{block.content}" for block in blocks)
-        parent_id = stable_id(document.document_id, "parent", ordinal, *(block.block_id for block in blocks))
-        return ParentContext(
-            parent_id=parent_id,
-            document_id=document.document_id,
-            source_file=document.source_file,
-            content="\n\n".join(content_parts),
-            block_ids=[block.block_id for block in blocks],
-            section_path=list(section_path),
-            metadata={
-                "pages": sorted({block.page for block in blocks if block.page is not None}),
-                "sheets": sorted({block.sheet_name for block in blocks if block.sheet_name}),
-                "reading_order": min(block.reading_order for block in blocks),
-            },
-        )
-
-    # ---------------------------------------------------------------- children
-
-    def _chunk_parent(self, document, parent, blocks) -> list[ChildChunk]:
-        chunks: list[ChildChunk] = []
-        text_run: list[Block] = []
-        has_content = any(block.block_type != "heading" for block in blocks)
-
-        def flush_text():
-            if text_run:
-                chunks.extend(self._chunk_text_run(document, parent, list(text_run), len(chunks)))
-                text_run.clear()
+        def flush() -> None:
+            if run:
+                chunks.extend(self._chunk_text_run(document, list(run)))
+                run.clear()
 
         for block in blocks:
-            if block.block_type == "heading" and has_content:
-                continue  # Headings are already part of every child's section prefix.
+            if block.block_type == "heading" and self._section_key(block) in sections_with_content:
+                continue  # The heading is already part of every chunk's section header.
             if block.block_type == "caption" and block.metadata.get("attached_to"):
                 continue  # Embedded together with the figure/table it describes.
             if block.block_type in TEXT_TYPES:
-                text_run.append(block)
+                key = self._section_key(block)
+                if run and key != run_key:
+                    flush()
+                run_key = key
+                run.append(block)
                 continue
-            flush_text()
+            flush()
             if block.block_type == "table" and block.metadata.get("rows"):
-                chunks.extend(self._chunk_table(document, parent, block))
+                chunks.append(self._chunk_table(document, block))
             elif block.block_type in VISUAL_TYPES:
-                chunks.extend(self._chunk_visual(document, parent, block))
+                chunks.extend(self._chunk_visual(document, block))
             else:  # kpi, unstructured tables and anything new
-                chunks.extend(self._chunk_single(document, parent, block, block.content))
-        flush_text()
+                chunks.extend(self._chunk_single(document, block, block.content))
+        flush()
+        for ordinal, chunk in enumerate(chunks):
+            chunk.ordinal = ordinal
         return chunks
 
-    def _chunk_text_run(self, document, parent, blocks: list[Block], start_index: int) -> list[ChildChunk]:
+    @staticmethod
+    def _section_key(block: Block) -> tuple:
+        page = block.page if not block.section_path and not block.sheet_name else None
+        return (tuple(block.section_path), block.sheet_name, page)
+
+    # -------------------------------------------------------------------- text
+
+    def _chunk_text_run(self, document: ParsedDocument, blocks: list[Block]) -> list[Chunk]:
+        limit = self.config.text_chunk_chars
         groups: list[tuple[list[Block], str]] = []
         current: list[Block] = []
         current_text = ""
         for block in blocks:
-            if len(block.content) > self.config.child_chars:
+            if len(block.content) > limit:
                 if current:
                     groups.append((current, current_text))
                     current, current_text = [], ""
-                for piece in split_text(block.content, self.config.child_chars, 0):
+                for piece in split_text(block.content, limit, 0):
                     groups.append(([block], piece))
                 continue
             candidate = f"{current_text}\n\n{block.content}".strip()
-            if current and len(candidate) > self.config.child_chars:
+            if current and len(candidate) > limit:
                 groups.append((current, current_text))
                 current, candidate = [], block.content
             current.append(block)
@@ -130,87 +93,57 @@ class ParentChildChunker:
         if current:
             groups.append((current, current_text))
 
-        chunks = []
-        previous_text = ""
-        for index, (group_blocks, text) in enumerate(groups):
-            body = text
-            if previous_text and self.config.child_overlap_chars > 0:
-                body = f"{overlap_tail(previous_text, self.config.child_overlap_chars)}\n{text}"
-            previous_text = text
-            content = self._prefix(document, group_blocks[0], "text") + body
-            chunks.append(
-                self._make_child(document, parent, group_blocks, f"text-{start_index + index}", content, "text")
-            )
-        return chunks
+        return [
+            self._make_chunk(document, group_blocks, f"text-{index}", self._header(group_blocks[0]) + text, "text")
+            for index, (group_blocks, text) in enumerate(groups)
+        ]
 
-    def _chunk_table(self, document, parent, block: Block) -> list[ChildChunk]:
-        rows = block.metadata["rows"]
+    # ------------------------------------------------------------------- tables
+
+    def _chunk_table(self, document: ParsedDocument, block: Block) -> Chunk:
+        rows = [list(row) for row in block.metadata["rows"]]
         inherited = block.metadata.get("inherited_header")
-        header = inherited or rows[0]
-        body = rows if inherited else rows[1:]
-        if not body:
-            body, header = rows, None
-        width = max(len(row) for row in rows)
-        header_cells = list(header or []) + [""] * (width - len(header or []))
-        column_groups = self._column_groups(width)
-        origin = block.metadata.get("origin")
+        table_rows = ([list(inherited)] + rows) if inherited else rows
+        width = max(len(row) for row in table_rows)
+        table_rows = [row + [""] * (width - len(row)) for row in table_rows]
         title = block.metadata.get("caption") or ""
         notes = block.metadata.get("references") or []
 
-        chunks = []
-        size = self.config.table_rows_per_chunk
-        for row_start in range(0, len(body), size):
-            group_rows = body[row_start : row_start + size]
-            for group_index, columns in enumerate(column_groups):
-                selected = [[_cell(row, column) for column in columns] for row in group_rows]
-                table_rows = ([[header_cells[column] for column in columns]] if header else []) + selected
-                lines = []
-                if title:
-                    lines.append(f"Table title: {title}")
-                if inherited:
-                    lines.append("(Phần tiếp theo của bảng ở trang trước)")
-                if len(column_groups) > 1:
-                    lines.append(f"Columns {group_index + 1}/{len(column_groups)} (cột định danh được lặp lại)")
-                lines.append(rows_to_markdown(table_rows))
-                if notes:
-                    lines.append("Referenced by: " + " | ".join(notes))
-                content = self._prefix(document, block, "table") + "\n".join(lines)
-                cell_range = block.cell_range
-                data_offset = 0 if inherited or not header else 1
-                if origin:
-                    first_row = origin[0] + data_offset + row_start
-                    last_row = first_row + len(group_rows) - 1
-                    first_col = origin[1] + min(columns)
-                    last_col = origin[1] + max(columns)
-                    cell_range = f"{excel_column_name(first_col)}{first_row}:{excel_column_name(last_col)}{last_row}"
-                chunks.append(
-                    self._make_child(
-                        document,
-                        parent,
-                        [block],
-                        f"rows-{row_start}-{row_start + len(group_rows) - 1}-cols-{group_index}",
-                        content,
-                        "table",
-                        cell_range=cell_range,
-                        metadata={
-                            "row_start": row_start,
-                            "row_end": row_start + len(group_rows) - 1,
-                            "columns": list(columns),
-                        },
-                    )
-                )
-        return chunks
+        def assemble(shown: list[list[str]], extra: list[str]) -> str:
+            lines = []
+            if title:
+                lines.append(f"Table title: {title}")
+            if inherited:
+                lines.append("(Phần tiếp theo của bảng ở trang trước)")
+            lines.extend(extra)
+            lines.append(rows_to_markdown(shown))
+            if notes:
+                lines.append("Referenced by: " + " | ".join(notes))
+            return self._header(block) + "\n".join(lines)
 
-    def _column_groups(self, width: int) -> list[list[int]]:
-        limit = max(self.config.table_max_columns_per_chunk, self.config.table_key_columns + 1)
-        if width <= limit:
-            return [list(range(width))]
-        keys = list(range(min(self.config.table_key_columns, width)))
-        others = [column for column in range(width) if column not in keys]
-        step = limit - len(keys)
-        return [keys + others[start : start + step] for start in range(0, len(others), step)]
+        content = assemble(table_rows, [])
+        metadata = {"table_rows": len(table_rows) - 1, "table_columns": width}
+        if len(content) > self.config.table_inline_max_chars:
+            preview_columns = max(1, self.config.table_preview_columns)
+            preview = [row[:preview_columns] for row in table_rows[: 1 + max(1, self.config.table_preview_rows)]]
+            path = table_xlsx_relpath(document.document_id, block.block_id)
+            columns = [cell for cell in table_rows[0] if cell][:MAX_LISTED_COLUMNS]
+            extra = [
+                f"[Bảng lớn: {len(table_rows) - 1} hàng × {width} cột; dưới đây là "
+                f"{len(preview) - 1} hàng và {min(preview_columns, width)} cột đầu. "
+                f"Bảng đầy đủ nằm trong file {path}]",
+            ]
+            if columns:
+                extra.append("Các cột: " + "; ".join(columns))
+            content = assemble(preview, extra)
+            metadata.update({"table_truncated": True, "table_file": path})
+        return self._make_chunk(
+            document, [block], "table-0", content, "table", cell_range=block.cell_range, metadata=metadata
+        )
 
-    def _chunk_visual(self, document, parent, block: Block) -> list[ChildChunk]:
+    # ------------------------------------------------------------------ visuals
+
+    def _chunk_visual(self, document: ParsedDocument, block: Block) -> list[Chunk]:
         lines = []
         if block.metadata.get("caption"):
             lines.append(f"Figure title/caption: {block.metadata['caption']}")
@@ -223,38 +156,35 @@ class ParentChildChunker:
         if block.metadata.get("references"):
             lines.append("Đoạn văn tham chiếu: " + " | ".join(block.metadata["references"]))
         chunk_type = image_type if block.block_type == "image" and image_type in VISUAL_TYPES else block.block_type
-        return self._chunk_single(document, parent, block, "\n".join(lines), chunk_type)
+        return self._chunk_single(document, block, "\n".join(lines), chunk_type, self.config.visual_max_chars)
 
-    def _chunk_single(self, document, parent, block, text, chunk_type=None) -> list[ChildChunk]:
+    def _chunk_single(self, document, block, text, chunk_type=None, limit=None) -> list[Chunk]:
         chunk_type = chunk_type or block.block_type
-        pieces = split_text(text, self.config.child_chars, self.config.child_overlap_chars) or [text]
+        pieces = split_text(text, limit or self.config.text_chunk_chars, 0) or [text]
         return [
-            self._make_child(
-                document, parent, [block], f"{chunk_type}-{index}", self._prefix(document, block, chunk_type) + piece, chunk_type
-            )
+            self._make_chunk(document, [block], f"{chunk_type}-{index}", self._header(block) + piece, chunk_type)
             for index, piece in enumerate(pieces)
             if piece.strip()
         ]
 
-    def _prefix(self, document: ParsedDocument, block: Block, content_type: str) -> str:
-        lines = [f"Document: {document.source_file}"]
+    # ------------------------------------------------------------------ helpers
+
+    def _header(self, block: Block) -> str:
+        """Short semantic header embedded with the chunk (file and page live in metadata)."""
+        lines = []
         if block.section_path:
             lines.append(f"Section: {' > '.join(block.section_path)}")
-        if block.page is not None:
-            lines.append(f"Page: {block.page}")
         if block.sheet_name:
             lines.append(f"Sheet: {block.sheet_name}")
         if block.cell_range:
             lines.append(f"Range: {block.cell_range}")
-        lines.append(f"Content type: {content_type}")
-        return "\n".join(lines) + "\n\n"
+        return "\n".join(lines) + "\n\n" if lines else ""
 
-    def _make_child(self, document, parent, blocks, position, content, chunk_type, cell_range=None, metadata=None):
+    def _make_chunk(self, document, blocks, position, content, chunk_type, cell_range=None, metadata=None) -> Chunk:
         first = blocks[0]
         pages = [block.page for block in blocks if block.page is not None]
-        return ChildChunk(
-            chunk_id=stable_id(parent.parent_id, *(block.block_id for block in blocks), position),
-            parent_id=parent.parent_id,
+        return Chunk(
+            chunk_id=stable_id(document.document_id, "chunk", *(block.block_id for block in blocks), position),
             document_id=document.document_id,
             source_file=document.source_file,
             chunk_type=chunk_type,

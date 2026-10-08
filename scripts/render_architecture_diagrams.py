@@ -38,6 +38,8 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     candidates = [
         Path("C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf"),
         Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -195,7 +197,7 @@ def render_overview():
         ("Tài liệu", "PDF · DOCX · Excel", "input"),
         ("Đọc nội dung", "Text · bảng · hình", "process"),
         ("Ghép quan hệ", "Đoạn · bảng · biểu đồ", "process"),
-        ("Chia nhỏ", "Parent và child", "process"),
+        ("Chia nhỏ", "Theo cấu trúc", "process"),
         ("Tạo vector", "Dense và BM25", "model"),
         ("Đóng băng", "Qdrant + metadata bundle", "store"),
     ]
@@ -206,13 +208,13 @@ def render_overview():
         ("Câu hỏi", "Tiếng Việt", "input"),
         ("Tìm kiếm", "Ý nghĩa + từ khóa", "process"),
         ("Xếp hạng", "Chọn đoạn tốt nhất", "model"),
-        ("Lấy ngữ cảnh", "Mở rộng parent", "process"),
+        ("Lấy ngữ cảnh", "Lân cận + bảng đủ", "process"),
         ("Qwen trả lời", "Chỉ dùng context", "model"),
         ("Kết quả", "Answer + nguồn", "output"),
     ]
     bottom_positions = horizontal_chain(d, chat, 575, box_size=(205, 125), gap=32)
     d.note((535, 447), "corpus_bundle.zip được chuyển sang session hỏi đáp; không ingest thêm.", max_width=720)
-    d.note((70, 820), "Mục tiêu: tìm đúng bằng child chunk, trả lời đủ ngữ cảnh bằng parent và luôn chỉ ra nguồn.")
+    d.note((70, 820), "Mục tiêu: mỗi chunk là một đơn vị trọn vẹn (đoạn, bảng, ảnh); bảng đầy đủ nằm trong file .xlsx; luôn chỉ ra nguồn.")
     d.save("01-system-overview.png")
 
 
@@ -261,39 +263,39 @@ def render_parsing():
     d.save("02-document-parsing.png")
 
 
-def render_parent_child():
+def render_structure_aware():
     d = Diagram(
-        "Parent-child chunking",
-        "Child giúp tìm chính xác; parent giúp giữ trọn ý nghĩa của nội dung.",
+        "Structure-aware chunking",
+        "Mỗi chunk là một đơn vị trọn vẹn: một nhóm đoạn, một bảng hoặc một ảnh.",
     )
     d.box(
         (330, 175),
         (940, 145),
-        "PARENT: Quy trình phê duyệt khoản vay",
-        "Đoạn giải thích + flowchart + bảng điều kiện + caption",
+        "Section: Quy trình phê duyệt khoản vay",
+        "Heading định nghĩa section_path; block được đọc theo thứ tự trang",
         "output",
     )
 
-    children = [
-        (90, "Child 1", "Đoạn giải thích"),
-        (465, "Child 2", "Nội dung flowchart"),
-        (840, "Child 3", "Bảng - hàng 1 đến 15"),
-        (1215, "Child 4", "Bảng - hàng 16 đến 30"),
+    chunks = [
+        (90, "Chunk text", "Các đoạn cùng mục, không overlap"),
+        (465, "Chunk ảnh", "1 ảnh = OCR + caption + VLM"),
+        (840, "Chunk bảng nhỏ", "Cả bảng dạng markdown"),
+        (1215, "Chunk bảng lớn", "Preview 5 hàng/cột + file .xlsx"),
     ]
-    for x, title, body in children:
+    for x, title, body in chunks:
         d.box((x, 410), (295, 115), title, body, "input")
         d.arrow((800, 320), (x + 147, 400), color="#7C6BA8", width=3)
 
     d.box((85, 665), (330, 115), "Câu hỏi", "CIC không đạt thì xử lý thế nào?", "process")
-    d.box((520, 665), (270, 115), "Tìm thấy", "Child 2", "model")
-    d.box((900, 665), (275, 115), "Mở rộng", "Lấy parent_id", "process")
-    d.box((1280, 665), (245, 115), "Context", "Chỉ lấy phần liên quan", "store")
+    d.box((520, 665), (270, 115), "Tìm thấy", "Chunk ảnh", "model")
+    d.box((900, 665), (275, 115), "Mở rộng", "Chunk lân cận + quan hệ", "process")
+    d.box((1280, 665), (245, 115), "Context", "Bảng lớn được nạp đủ hàng", "store")
     d.arrow((415, 722), (510, 722))
     d.arrow((790, 722), (890, 722))
     d.arrow((1175, 722), (1270, 722))
     d.arrow((612, 525), (655, 655), dashed=True, label="retrieval hit")
-    d.note((90, 835), "Không nhét cả section dài vào prompt: ưu tiên child trúng query và các block có quan hệ trực tiếp.")
-    d.save("03-parent-child.png")
+    d.note((90, 835), "Không cắt bảng hay ảnh; chỉ tách đoạn quá dài ở ranh giới câu. Thực thể và từ khoá của tài liệu được index kèm.")
+    d.save("03-structure-aware.png")
 
 
 def render_retrieval():
@@ -313,7 +315,7 @@ def render_retrieval():
 
     chain = [
         (80, "Reranker", "Chọn 5-8 đoạn", "model"),
-        (395, "Mở rộng parent", "Lấy phần liên quan", "process"),
+        (395, "Mở rộng chunk", "Lân cận + bảng đủ", "process"),
         (710, "Tính toán", "Python nếu cần", "process"),
         (1025, "Qwen", "Viết câu trả lời", "model"),
         (1340, "Kết quả", "Answer + citation", "output"),
@@ -335,8 +337,8 @@ def render_storage():
     d.box((600, 175), (400, 105), "Frozen corpus bundle", "Manifest + checksum + dữ liệu retrieval", "output")
 
     stores = [
-        (65, "Qdrant", "Vector + child chunks", "Tìm kiếm"),
-        (450, "SQLite", "Parent + document graph", "Nối ngữ cảnh"),
+        (65, "Qdrant", "Vector + chunks", "Tìm kiếm"),
+        (450, "SQLite", "Chunk + thực thể + graph", "Nối ngữ cảnh"),
         (835, "JSON / Parquet", "Hàng và cột gốc", "Tính toán"),
         (1220, "Asset storage", "Ảnh crop cần thiết", "Xem nguồn"),
     ]
@@ -390,7 +392,7 @@ def render_gpu():
 def main():
     render_overview()
     render_parsing()
-    render_parent_child()
+    render_structure_aware()
     render_retrieval()
     render_storage()
     render_gpu()

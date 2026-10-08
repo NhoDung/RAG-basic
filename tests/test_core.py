@@ -6,14 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rag_kaggle.chunking import ParentChildChunker, split_text
+from rag_kaggle.chunking import StructureAwareChunker, split_text
 from rag_kaggle.computation import compute_from_blocks, detect_operation
 from rag_kaggle.config import ChunkingConfig, PipelineConfig
 from rag_kaggle.evaluation import answer_correct, hit_matches, retrieval_metrics
 from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
 from rag_kaggle.hardware import configure_ingestion_devices, configure_kaggle_devices, configure_retrieval_devices
-from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
+from rag_kaggle.models import Block, Chunk, ParsedDocument, SearchHit
 from rag_kaggle.ocr_correction import (
     OCRCorrectionCoordinator,
     build_correction_prompt,
@@ -93,7 +93,7 @@ class CorePipelineTests(unittest.TestCase):
         try:
             document = ParsedDocument("doc-v1", "report.pdf", "pdf", "content-hash")
             document.metadata = {"original_file_name": "report.pdf", "uploaded_at": "2026-10-07T00:00:00+00:00"}
-            store.upsert_document(document, [], [])
+            store.upsert_document(document, [])
             self.assertEqual(
                 {"document_id": "doc-v1"},
                 store.document_by_original_and_hash("report.pdf", "content-hash"),
@@ -102,7 +102,7 @@ class CorePipelineTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_parent_child_chunking(self):
+    def test_structure_aware_chunking(self):
         config = PipelineConfig()
         document = ParsedDocument("doc1", "sample.xlsx", "xlsx", "hash")
         rows = [["Loại thẻ", "Phí"], ["Visa Gold", "499000"]]
@@ -121,11 +121,12 @@ class CorePipelineTests(unittest.TestCase):
             ),
         ]
 
-        parents, chunks = ParentChildChunker(config.chunking).chunk(document)
+        chunks = StructureAwareChunker(config.chunking).chunk(document)
 
-        self.assertEqual(2, len(parents))
         self.assertEqual(2, len(chunks))
+        self.assertEqual([0, 1], [chunk.ordinal for chunk in chunks])
         self.assertIn("Sheet: Biểu phí", chunks[1].content)
+        self.assertIn("Visa Gold", chunks[1].content)
         self.assertEqual(36, len(qdrant_point_id(chunks[0].chunk_id)))
         self.assertGreater(chunks[0].token_count, 0)
         self.assertTrue(chunks[0].chunker_version)
@@ -134,12 +135,11 @@ class CorePipelineTests(unittest.TestCase):
         store = MetadataStore(Path(":memory:"))
         document = ParsedDocument("doc1", "sample.pdf", "pdf", "hash")
         document.blocks = [Block("b1", "doc1", "text", "Nội dung", "sample.pdf", page=1)]
-        parents, chunks = ParentChildChunker(PipelineConfig().chunking).chunk(document)
+        chunks = StructureAwareChunker(PipelineConfig().chunking).chunk(document)
 
-        store.upsert_document(document, parents, chunks)
+        store.upsert_document(document, chunks)
 
         self.assertEqual(1, store.stats()["documents"])
-        self.assertEqual(parents[0], store.get_parent(parents[0].parent_id))
         self.assertEqual(chunks[0], store.get_chunk(chunks[0].chunk_id))
         store.delete_document("doc1")
         self.assertEqual(0, store.stats()["chunks"])
@@ -267,11 +267,11 @@ class ChunkingTests(unittest.TestCase):
             make_block(f"b{i}", "text", f"Đoạn văn số {i} về quy trình.", i, section_path=["A"], page=1)
             for i in range(5)
         ]
-        _, chunks = ParentChildChunker(ChunkingConfig()).chunk(document)
+        chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
         self.assertEqual(1, len(chunks))
         self.assertEqual([f"b{i}" for i in range(5)], chunks[0].block_ids)
 
-    def test_wide_table_repeats_key_column_and_excel_range(self):
+    def test_small_table_is_one_whole_markdown_chunk(self):
         header = ["Chi nhánh"] + [f"T{i}" for i in range(1, 13)]
         rows = [header] + [[f"CN{r}"] + [str(r * c) for c in range(1, 13)] for r in range(1, 21)]
         block = make_block(
@@ -279,12 +279,58 @@ class ChunkingTests(unittest.TestCase):
             metadata={"rows": rows, "origin": [4, 1]},
         )
         document = ParsedDocument("doc1", "bao_cao.xlsx", "xlsx", "hash", blocks=[block])
-        config = ChunkingConfig(table_rows_per_chunk=10, table_max_columns_per_chunk=7, table_key_columns=1)
-        _, chunks = ParentChildChunker(config).chunk(document)
-        self.assertEqual(4, len(chunks))  # 2 row groups x 2 column groups
-        self.assertTrue(all("Chi nhánh" in chunk.content for chunk in chunks))
-        self.assertEqual("A5:G14", chunks[0].cell_range)
-        self.assertEqual("A15:M24", chunks[3].cell_range)
+        chunks = StructureAwareChunker(ChunkingConfig(table_inline_max_chars=20000)).chunk(document)
+        self.assertEqual(1, len(chunks))
+        self.assertEqual("A4:M24", chunks[0].cell_range)
+        self.assertIn("| CN20 |", chunks[0].content)
+        self.assertIn("| T12 |", chunks[0].content)
+        self.assertNotIn("table_file", chunks[0].metadata)
+
+    def test_large_table_is_preview_plus_workbook_reference(self):
+        header = ["Chi nhánh"] + [f"T{i}" for i in range(1, 13)]
+        rows = [header] + [[f"CN{r}"] + [str(r * c) for c in range(1, 13)] for r in range(1, 41)]
+        block = make_block("t1", "table", rows_to_markdown(rows), 0, sheet_name="DT", metadata={"rows": rows})
+        document = ParsedDocument("doc1", "bao_cao.xlsx", "xlsx", "hash", blocks=[block])
+        chunks = StructureAwareChunker(
+            ChunkingConfig(table_inline_max_chars=1500, table_preview_rows=3, table_preview_columns=4)
+        ).chunk(document)
+        self.assertEqual(1, len(chunks))
+        chunk = chunks[0]
+        self.assertTrue(chunk.metadata["table_truncated"])
+        self.assertEqual("tables/doc1/t1.xlsx", chunk.metadata["table_file"])
+        self.assertEqual(40, chunk.metadata["table_rows"])
+        self.assertIn("| CN3 |", chunk.content)
+        self.assertNotIn("| CN4 |", chunk.content)
+        self.assertNotIn("| T5 |", chunk.content)  # only the first 4 columns are shown
+        self.assertIn("T12", chunk.content)  # ...but every column name is listed
+        self.assertIn("tables/doc1/t1.xlsx", chunk.content)
+
+    def test_image_is_never_split_below_visual_limit(self):
+        text = " ".join(f"Dòng OCR số {i}." for i in range(150))  # ~2.5k chars > text limit
+        block = make_block("i1", "image", text, 0, page=1, metadata={"image_type": "image"})
+        document = ParsedDocument("doc1", "scan.pdf", "pdf", "hash", blocks=[block])
+        chunks = StructureAwareChunker(ChunkingConfig(text_chunk_chars=1800, visual_max_chars=6000)).chunk(document)
+        self.assertEqual(1, len(chunks))
+        self.assertIn(text, chunks[0].content)
+
+    def test_oversized_paragraph_splits_at_sentence_boundaries_without_overlap(self):
+        text = " ".join(f"Câu số {i} nói về quy trình phê duyệt." for i in range(120))
+        block = make_block("p1", "text", text, 0, section_path=["A"], page=1)
+        document = ParsedDocument("doc1", "a.pdf", "pdf", "hash", blocks=[block])
+        chunks = StructureAwareChunker(ChunkingConfig(text_chunk_chars=500)).chunk(document)
+        self.assertGreater(len(chunks), 3)
+        bodies = [chunk.content.split("\n\n", 1)[1] for chunk in chunks]
+        self.assertEqual(text, " ".join(bodies))
+        self.assertTrue(all(body.rstrip().endswith(".") for body in bodies))
+
+    def test_new_section_starts_new_chunk(self):
+        document = ParsedDocument("doc1", "a.pdf", "pdf", "hash")
+        document.blocks = [
+            make_block("a", "text", "Nội dung mục một.", 0, section_path=["Một"], page=1),
+            make_block("b", "text", "Nội dung mục hai.", 1, section_path=["Hai"], page=1),
+        ]
+        chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
+        self.assertEqual([["a"], ["b"]], [chunk.block_ids for chunk in chunks])
 
 
 class RelationshipTests(unittest.TestCase):
@@ -306,7 +352,7 @@ class RelationshipTests(unittest.TestCase):
         self.assertIn(("t2", "t1", "continues"), kinds)
         self.assertIn(("p", "h", "belongs_to_section"), kinds)
         self.assertEqual(rows[0], document.blocks[4].metadata["inherited_header"])
-        _, chunks = ParentChildChunker(ChunkingConfig()).chunk(document)
+        chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
         table_chunk = next(chunk for chunk in chunks if chunk.block_ids == ["t1"])
         self.assertIn("Table title: Bảng 2: Phí thường niên", table_chunk.content)
         continued = next(chunk for chunk in chunks if chunk.block_ids == ["t2"])
@@ -365,7 +411,7 @@ class ComputationAndGuardrailTests(unittest.TestCase):
         self.assertIn("Tiếp nhận → Thẩm định", render_vlm_output(output))
 
     def test_evaluation_metrics(self):
-        chunk = ChildChunk("c1", "p1", "d1", "bieu_phi.pdf", "table", "x", ["b1"], page_start=12, page_end=12)
+        chunk = Chunk("c1", "d1", "bieu_phi.pdf", "table", "x", ["b1"], page_start=12, page_end=12)
         item = {"question": "q", "expected_answer": "499.000 VND", "expected_document": "bieu_phi.pdf",
                 "expected_location": {"page": 12}}
         self.assertTrue(hit_matches(SearchHit(chunk), item))
@@ -450,7 +496,7 @@ class FakeOCRCorrector:
         self.fail_first = fail_first
         self.unloaded = False
 
-    def correct(self, previous_corrected, current_ocr):
+    def correct(self, previous_corrected, current_ocr, glossary=(), table=False):
         self.calls.append((previous_corrected, current_ocr))
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("synthetic correction failure")

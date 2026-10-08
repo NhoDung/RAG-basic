@@ -77,48 +77,44 @@ class ParsedDocument:
 
 
 @dataclass
-class ParentContext:
-    parent_id: str
-    document_id: str
-    source_file: str
-    content: str
-    block_ids: list[str]
-    section_path: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+class Chunk:
+    """One retrievable unit: a text unit, a whole table (or its preview) or an image."""
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class ChildChunk:
     chunk_id: str
-    parent_id: str
     document_id: str
     source_file: str
     chunk_type: str
     content: str
     block_ids: list[str]
+    ordinal: int = 0
     section_path: list[str] = field(default_factory=list)
     page_start: int | None = None
     page_end: int | None = None
     sheet_name: str | None = None
     cell_range: str | None = None
     asset_path: str | None = None
+    # Canonical entity names / document keywords, set after the document profile exists.
+    entities: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     token_count: int = 0
     parser_version: str = ""
     chunker_version: str = ""
+
+    @property
+    def section_key(self) -> str:
+        return " > ".join(self.section_path)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def payload(self) -> dict[str, Any]:
         """Qdrant payload: searchable content and filter metadata only, no large tables."""
+        profile = self.metadata.get("profile") or {}
         return {
             "chunk_id": self.chunk_id,
             "document_id": self.document_id,
-            "parent_id": self.parent_id,
+            "ordinal": self.ordinal,
             "chunk_type": self.chunk_type,
             "content": self.content,
             "source_file": self.source_file,
@@ -128,15 +124,25 @@ class ChildChunk:
             "sheet_name": self.sheet_name,
             "cell_range": self.cell_range,
             "asset_path": self.asset_path,
+            "table_file": self.metadata.get("table_file"),
+            "entities": self.entities,
+            "keywords": self.keywords,
+            "doc_title": profile.get("title"),
+            "doc_number": profile.get("doc_number"),
+            "issue_date": profile.get("issue_date"),
+            "signers": profile.get("signers") or [],
             "original_file_name": self.metadata.get("original_file_name", self.source_file),
             "uploaded_at": self.metadata.get("uploaded_at"),
             "content_hash": self.metadata.get("content_hash"),
         }
 
 
+ChildChunk = Chunk  # Backward-compatible name used by older code and notebooks.
+
+
 @dataclass
 class SearchHit:
-    chunk: ChildChunk
+    chunk: Chunk
     dense_rank: int | None = None
     sparse_rank: int | None = None
     rrf_score: float = 0.0
