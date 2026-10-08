@@ -92,15 +92,13 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
 EMBEDDING_QUERY_INSTRUCTION = None
 
-# Tên hiển thị ở panel Input của Kaggle. Không cần biết folder con bên trong dataset.
-INPUT_DATASET_SLUGS = [
-    "raw-data",  # đổi theo tên dataset của bạn trong panel Input
+# Liệt kê tên các dataset theo đường dẫn thực tế được Kaggle mount.
+INPUT_SOURCES = [
+    "/kaggle/input/datasets/huythinhuet/raw-data-small",
 ]
-KAGGLE_INPUT_ROOT = Path("/kaggle/input")
-INPUT_SOURCES = [KAGGLE_INPUT_ROOT / slug for slug in INPUT_DATASET_SLUGS]
 
 # Có thể thêm đường dẫn file/folder cụ thể nếu cần:
-# INPUT_SOURCES.append(KAGGLE_INPUT_ROOT / "another-dataset" / "report.pdf")
+# INPUT_SOURCES.append("/kaggle/input/datasets/owner/another-dataset/report.pdf")
 
 WORK_DIR = Path("/kaggle/working/rag_ingestion")
 OUTPUT_BUNDLE = Path("/kaggle/working/corpus_bundle.zip")
@@ -210,7 +208,8 @@ pipeline = IngestionPipeline(config)
 
 print("Configured input sources:")
 for source in INPUT_SOURCES:
-    print(" -", source, "exists=" + str(source.exists()))
+    source_path = Path(source)
+    print(" -", source_path, "exists=" + str(source_path.exists()))
 
 files, discovery = discover_input_files(INPUT_SOURCES, config)
 print(f"Found {len(files)} supported document(s):")
@@ -221,10 +220,11 @@ if discovery["skipped"]:
     for item in discovery["skipped"][:30]:
         print(" -", item)
 if not files:
-    mounted = sorted(path.name for path in KAGGLE_INPUT_ROOT.iterdir()) if KAGGLE_INPUT_ROOT.exists() else []
+    kaggle_input_root = Path("/kaggle/input/datasets")
+    mounted = sorted(str(path) for path in kaggle_input_root.glob("*/*")) if kaggle_input_root.exists() else []
     raise ValueError(
         f"Không tìm thấy tài liệu hỗ trợ. Dataset đang được mount: {mounted}. "
-        f"Hãy sửa INPUT_DATASET_SLUGS cho trùng tên trong panel Input."
+        f"Hãy sửa INPUT_SOURCES theo đúng đường dẫn hiển thị trên Kaggle."
     )
 
 report = pipeline.ingest(files, reset=True, progress=print)
