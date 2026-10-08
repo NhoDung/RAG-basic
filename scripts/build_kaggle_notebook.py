@@ -96,9 +96,11 @@ EMBEDDING_QUERY_INSTRUCTION = None
 INPUT_SOURCES = [
     "/kaggle/input/datasets/huythinhuet/raw-data-small",
 ]
+# Chuẩn hóa ngay tại đây để các cell phía sau có thể gọi .exists(), .name, v.v.
+INPUT_SOURCES = [Path(source) for source in INPUT_SOURCES]
 
 # Có thể thêm đường dẫn file/folder cụ thể nếu cần:
-# INPUT_SOURCES.append("/kaggle/input/datasets/owner/another-dataset/report.pdf")
+# INPUT_SOURCES.append(Path("/kaggle/input/datasets/owner/another-dataset/report.pdf"))
 
 WORK_DIR = Path("/kaggle/working/rag_ingestion")
 OUTPUT_BUNDLE = Path("/kaggle/working/corpus_bundle.zip")
