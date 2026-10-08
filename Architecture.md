@@ -996,7 +996,7 @@ thi instruction trong tài liệu và từ chối khi không có evidence.
 Preset vận hành ưu tiên Kaggle T4 x2 và khoảng 30 GiB RAM. Hai session không giữ chung model:
 
 ```text
-Ingestion: GPU 0 embedding/optional VLM; GPU 1 PaddleOCR-VL
+Ingestion: GPU 0 OCR correction then embedding/optional VLM; GPU 1 PaddleOCR-VL
 Retrieve:  GPU 0 Qwen answer; GPU 1 query embedding
 CPU: Qdrant, BM25, metadata; reranker trong retrieve
 ```
@@ -1005,7 +1005,10 @@ CPU: Qdrant, BM25, metadata; reranker trong retrieve
 
 ```text
 Parse
-  -> GPU 1: load PaddleOCR-VL, xử lý page/image/chart, dừng worker
+  -> GPU 1: load PaddleOCR-VL, xử lý page/image/chart
+  -> GPU 0: load OCR correction LLM; sửa component đã OCR theo reading order,
+     chỉ dùng component đã sửa liền trước làm context và chạy song song với OCR
+  -> bounded ordered buffer drain correction, dừng OCR worker và unload correction LLM
   -> GPU 0 optional: load Qwen-VL cho flowchart phức tạp, unload VLM
   -> GPU 0: load embedding model, encode, unload
   -> CPU: persist Qdrant + BM25 + metadata + assets

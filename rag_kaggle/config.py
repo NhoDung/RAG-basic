@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-PARSER_VERSION = "0.2.0"
+PARSER_VERSION = "0.3.0"
 CHUNKER_VERSION = "0.2.0"
 ARTIFACT_SCHEMA_VERSION = 1
 
@@ -42,6 +42,25 @@ class ParsingConfig:
     heading_max_chars: int = 160
     write_table_parquet: bool = True
     libreoffice_binary: str | None = None
+
+
+@dataclass
+class OCRCorrectionConfig:
+    """Settings for the ordered OCR spelling-correction stage."""
+
+    enabled: bool = False
+    model: str = "Qwen/Qwen2.5-3B-Instruct"
+    revision: str | None = None
+    device: str | None = None
+    load_in_4bit: bool = True
+    temperature: float = 0.0
+    max_new_tokens: int = 1024
+    max_input_tokens: int = 6000
+    max_buffered_components: int = 8
+    max_retries: int = 1
+    fail_open: bool = True
+    correct_labels: tuple[str, ...] = ("doc_title", "paragraph_title", "text", "caption")
+    correct_tables: bool = False
 
 
 @dataclass
@@ -142,6 +161,7 @@ class PipelineConfig:
     collection_name: str = "rag_chunks"
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     parsing: ParsingConfig = field(default_factory=ParsingConfig)
+    ocr_correction: OCRCorrectionConfig = field(default_factory=OCRCorrectionConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)

@@ -14,6 +14,11 @@ from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
 from rag_kaggle.hardware import configure_ingestion_devices, configure_kaggle_devices, configure_retrieval_devices
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
+from rag_kaggle.ocr_correction import (
+    OCRCorrectionCoordinator,
+    build_correction_prompt,
+    validate_correction,
+)
 from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.pipeline import IngestionPipeline, PipelineModeError, RetrievalAnswerPipeline
 from rag_kaggle.parsers import DocumentParser, classify_excel_region, rows_to_markdown
@@ -239,6 +244,7 @@ class UtilityTests(unittest.TestCase):
         ingestion = PipelineConfig()
         self.assertEqual("ingestion_dual_gpu", configure_ingestion_devices(ingestion, gpu_count=2)["mode"])
         self.assertEqual("cuda:0", ingestion.retrieval.dense_device)
+        self.assertEqual("cuda:0", ingestion.ocr_correction.device)
         retrieval = PipelineConfig()
         self.assertEqual("retrieval_dual_gpu", configure_retrieval_devices(retrieval, gpu_count=2)["mode"])
         self.assertEqual("cuda:1", retrieval.retrieval.dense_device)
@@ -436,6 +442,95 @@ class OCRWorkerTests(unittest.TestCase):
         # One worker spawn with two constructor attempts (pipeline_version, then default).
         self.assertEqual(2, self.log.read_text(encoding="utf-8").count("library noise"))
         self.assertEqual("v1.6", pipeline_version_for("PaddleOCR-VL-1.6"))
+
+
+class FakeOCRCorrector:
+    def __init__(self, fail_first=False):
+        self.calls = []
+        self.fail_first = fail_first
+        self.unloaded = False
+
+    def correct(self, previous_corrected, current_ocr):
+        self.calls.append((previous_corrected, current_ocr))
+        if self.fail_first and len(self.calls) == 1:
+            raise RuntimeError("synthetic correction failure")
+        return current_ocr + " fixed", {"prompt_tokens": 2, "completion_tokens": 1}
+
+    def unload(self):
+        self.unloaded = True
+
+
+class OCRCorrectionTests(unittest.TestCase):
+    def _block(self, document_id, content):
+        return Block("b-" + content, document_id, "text", content, "scan.pdf", metadata={})
+
+    def test_prompt_only_contains_previous_and_current_components(self):
+        system, prompt = build_correction_prompt("corrected previous", "current OCR")
+        self.assertIn("corrected previous", prompt)
+        self.assertIn("current OCR", prompt)
+        self.assertIn("SKILL:", prompt)
+        self.assertNotIn("older component", system + prompt)
+
+    def test_protected_values_cannot_change(self):
+        self.assertEqual((True, None), validate_correction("Phi 499.000 VND", "Phí 499.000 VND"))
+        self.assertEqual("protected_token_changed", validate_correction("Ma AB-12, 499.000", "Ma AB-12")[1])
+
+    def test_ordered_worker_uses_previous_corrected_output(self):
+        config = PipelineConfig()
+        config.ocr_correction.enabled = True
+        config.ocr_correction.max_buffered_components = 2
+        corrector = FakeOCRCorrector()
+        coordinator = OCRCorrectionCoordinator(config, corrector=corrector)
+        try:
+            coordinator.begin_document("doc-a")
+            blocks = [self._block("doc-a", text) for text in ("one", "two", "three")]
+            for block in blocks:
+                coordinator.submit(block, "text")
+            stats = coordinator.finish_document("doc-a")
+            self.assertEqual([("", "one"), ("one fixed", "two"), ("two fixed", "three")], corrector.calls)
+            self.assertEqual("three fixed", blocks[-1].content)
+            self.assertEqual(3, stats["success_count"])
+            self.assertEqual("one", blocks[0].metadata["ocr_text_raw"])
+        finally:
+            coordinator.close()
+
+    def test_failure_falls_back_and_advances_frontier(self):
+        config = PipelineConfig()
+        config.ocr_correction.enabled = True
+        config.ocr_correction.max_retries = 0
+        corrector = FakeOCRCorrector(fail_first=True)
+        coordinator = OCRCorrectionCoordinator(config, corrector=corrector)
+        try:
+            coordinator.begin_document("doc-b")
+            first, second = self._block("doc-b", "first"), self._block("doc-b", "second")
+            coordinator.submit(first, "text")
+            coordinator.submit(second, "text")
+            stats = coordinator.finish_document("doc-b")
+            self.assertEqual("first", first.content)
+            self.assertEqual("fallback", first.metadata["ocr_correction"]["status"])
+            self.assertEqual(("first", "second"), corrector.calls[1])
+            self.assertEqual(1, stats["fallback_count"])
+        finally:
+            coordinator.close()
+
+    def test_context_resets_between_documents(self):
+        config = PipelineConfig()
+        config.ocr_correction.enabled = True
+        corrector = FakeOCRCorrector()
+        coordinator = OCRCorrectionCoordinator(config, corrector=corrector)
+        try:
+            first = self._block("doc-one", "first")
+            coordinator.begin_document("doc-one")
+            coordinator.submit(first, "text")
+            coordinator.finish_document("doc-one")
+
+            second = self._block("doc-two", "second")
+            coordinator.begin_document("doc-two")
+            coordinator.submit(second, "text")
+            coordinator.finish_document("doc-two")
+            self.assertEqual(("", "second"), corrector.calls[-1])
+        finally:
+            coordinator.close()
 
 
 class FakeSentenceModel:

@@ -26,6 +26,7 @@ from .guardrails import (
 )
 from .ingestion import IngestionError, discover_input_files, validate_file
 from .models import StageStatus
+from .ocr_correction import OCRCorrectionCoordinator, PROMPT_VERSION
 from .paddleocr_vl import PaddleOCRVLAdapter
 from .parsers import DocumentParser, save_parsed_document, save_table_parquet
 from .relationships import build_relationships
@@ -58,6 +59,10 @@ class RAGPipeline:
         self.mode = mode
         self.config.create_directories()
         if mode in ("full", "ingestion"):
+            if self.config.ocr_correction.enabled and self.config.vision.enabled:
+                raise ValueError(
+                    "OCR correction and optional VLM cannot share cuda:0 in one parse pass; disable one of them."
+                )
             self.ocr = PaddleOCRVLAdapter(
                 model_name=self.config.parsing.ocr_model_name,
                 model_dir=self.config.parsing.ocr_model_dir,
@@ -66,10 +71,13 @@ class RAGPipeline:
                 cuda_visible_devices=self.config.parsing.ocr_cuda_visible_devices,
             )
             self.vision = VisionReasoner(self.config)
-            self.parser = DocumentParser(self.config, self.ocr, self.vision)
+            self.ocr_correction = (
+                OCRCorrectionCoordinator(self.config) if self.config.ocr_correction.enabled else None
+            )
+            self.parser = DocumentParser(self.config, self.ocr, self.vision, self.ocr_correction)
             self.chunker = ParentChildChunker(self.config.chunking)
         else:
-            self.ocr = self.vision = self.parser = self.chunker = None
+            self.ocr = self.vision = self.parser = self.chunker = self.ocr_correction = None
         if mode in ("full", "retrieval"):
             self.reranker = Reranker(self.config)
             self.generator = LocalQwen(self.config)
@@ -228,8 +236,22 @@ class RAGPipeline:
                     started=started,
                 )
                 for warning in warnings:
-                    if warning.get("stage") in ("ocr", "vlm"):
+                    if warning.get("stage") in ("ocr", "vlm", "ocr_correction"):
                         record(warning["stage"], "partial", name, document.document_id, message=warning["message"], retryable=True)
+                correction = document.metadata.get("ocr_correction")
+                if correction is not None:
+                    correction_status = "partial" if correction.get("fallback_count") else "success"
+                    record(
+                        "ocr_correction",
+                        correction_status,
+                        name,
+                        document.document_id,
+                        message=(
+                            f"{correction.get('component_count', 0)} components; "
+                            f"{correction.get('fallback_count', 0)} fallback"
+                        ),
+                        retryable=bool(correction.get("fallback_count")),
+                    )
 
                 stage_started = time.perf_counter()
                 build_relationships(document)
@@ -261,6 +283,7 @@ class RAGPipeline:
                         "parents": len(parents),
                         "chunks": len(chunks),
                         "warnings": warnings,
+                        "ocr_correction": document.metadata.get("ocr_correction"),
                         "has_macros": facts.get("has_macros", False),
                     }
                 )
@@ -274,6 +297,8 @@ class RAGPipeline:
 
         self.ocr.unload()
         self.vision.unload()
+        if self.ocr_correction is not None:
+            self.ocr_correction.unload()
 
         if new_chunks or reset:
             started = time.perf_counter()
@@ -311,6 +336,12 @@ class RAGPipeline:
             "dense_model": self.metadata.get_setting("index.dense_model", self.config.retrieval.dense_model),
             "dense_dimension": self.metadata.get_setting("index.dimension"),
             "ocr_model": self.config.parsing.ocr_model_name,
+            "ocr_correction": {
+                "enabled": self.config.ocr_correction.enabled,
+                "model": self.config.ocr_correction.model if self.config.ocr_correction.enabled else None,
+                "revision": self.config.ocr_correction.revision if self.config.ocr_correction.enabled else None,
+                "prompt_version": PROMPT_VERSION if self.config.ocr_correction.enabled else None,
+            },
             "vlm_model": self.config.vision.model if self.config.vision.enabled else None,
             "parser_version": PARSER_VERSION,
             "chunker_version": CHUNKER_VERSION,
@@ -501,6 +532,7 @@ class RAGPipeline:
             },
             "models": {
                 "ocr": self.config.parsing.ocr_model_name,
+                "ocr_correction": self.config.ocr_correction.model if self.config.ocr_correction.enabled else None,
                 "vision": self.config.vision.model if self.config.vision.enabled else None,
             },
             "versions": {"parser": PARSER_VERSION, "chunker": CHUNKER_VERSION},
@@ -686,6 +718,8 @@ class RAGPipeline:
         return target
 
     def close(self):
+        if self.ocr_correction is not None:
+            self.ocr_correction.close()
         self.index.close()
         self.metadata.close()
 

@@ -29,6 +29,7 @@ def configure_kaggle_devices(config: PipelineConfig, gpu_count: int | None = Non
     if gpu_count >= 2:
         config.parsing.ocr_cuda_visible_devices = "1"
         config.retrieval.dense_device = "cuda:1"
+        config.ocr_correction.device = "cuda:0"
         config.retrieval.reranker_device = "cpu"
         config.retrieval.reranker_use_fp16 = False
         config.generation.device = "cuda:0"
@@ -42,6 +43,7 @@ def configure_kaggle_devices(config: PipelineConfig, gpu_count: int | None = Non
 
     if gpu_count == 1:
         config.parsing.ocr_cuda_visible_devices = "0"
+        config.ocr_correction.device = "cuda:0"
         config.retrieval.dense_device = "cuda:0"
         config.retrieval.reranker_device = "cuda:0"
         config.generation.device = "cuda:0"
@@ -52,6 +54,7 @@ def configure_kaggle_devices(config: PipelineConfig, gpu_count: int | None = Non
         }
 
     config.retrieval.dense_device = "cpu"
+    config.ocr_correction.device = "cpu"
     config.retrieval.reranker_device = "cpu"
     config.retrieval.reranker_use_fp16 = False
     config.generation.device = None
@@ -65,19 +68,22 @@ def configure_ingestion_devices(config: PipelineConfig, gpu_count: int | None = 
     if gpu_count >= 2:
         config.parsing.ocr_cuda_visible_devices = "1"
         config.retrieval.dense_device = "cuda:0"
+        config.ocr_correction.device = "cuda:0"
         config.vision.device = "cuda:0"
         return {
             "mode": "ingestion_dual_gpu",
-            "gpu_0": ["dense embedding", "optional vision model (sequential)"],
+            "gpu_0": ["OCR correction LLM", "dense embedding (after correction)", "optional vision model (exclusive)"],
             "gpu_1": ["PaddleOCR-VL worker"],
             "cpu": ["parsing", "chunking", "Qdrant", "BM25", "metadata"],
         }
     if gpu_count == 1:
         config.parsing.ocr_cuda_visible_devices = "0"
         config.retrieval.dense_device = "cuda:0"
+        config.ocr_correction.device = "cuda:0"
         config.vision.device = "cuda:0"
         return {"mode": "ingestion_single_gpu", "gpu_0": ["OCR", "vision", "embedding (sequential)"]}
     config.retrieval.dense_device = "cpu"
+    config.ocr_correction.device = "cpu"
     config.vision.device = None
     return {"mode": "ingestion_cpu_only", "warning": "No CUDA GPU was detected."}
 

@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 from .config import PARSER_VERSION, PipelineConfig
 from .ingestion import IngestionError, convert_with_libreoffice, find_libreoffice
 from .models import Block, ParsedDocument
+from .ocr_correction import OCRCorrectionCoordinator
 from .paddleocr_vl import PaddleOCRVLAdapter
 from .utils import (
     clean_text,
@@ -67,11 +68,14 @@ class DocumentParser:
         config: PipelineConfig,
         ocr: PaddleOCRVLAdapter | None = None,
         vision: VisionReasoner | None = None,
+        ocr_correction: OCRCorrectionCoordinator | None = None,
     ):
         self.config = config
         self.ocr = ocr
         self.vision = vision
+        self.ocr_correction = ocr_correction
         self._progress: Callable[[str], None] | None = None
+        self._active_correction_document_id: str | None = None
 
     def parse(
         self,
@@ -82,6 +86,7 @@ class DocumentParser:
         source = Path(path)
         extension = source.suffix.lower()
         previous_progress, self._progress = self._progress, progress
+        document: ParsedDocument | None = None
         try:
             if extension == ".pdf":
                 document = self._parse_pdf(source)
@@ -93,7 +98,13 @@ class DocumentParser:
                 document = self._parse_legacy_excel(source)
             else:
                 raise IngestionError("unsupported_type", f"Unsupported file type: {extension}")
+            self._finish_ocr_correction(document)
+        except Exception:
+            if self.ocr_correction is not None and self._active_correction_document_id is not None:
+                self.ocr_correction.abort_document(self._active_correction_document_id)
+            raise
         finally:
+            self._active_correction_document_id = None
             self._progress = previous_progress
         if display_name:
             document.source_file = display_name
@@ -139,7 +150,7 @@ class DocumentParser:
     def _new_document(self, source: Path) -> ParsedDocument:
         digest = file_sha256(source)
         document_id = stable_id(source.name, digest)
-        return ParsedDocument(
+        document = ParsedDocument(
             document_id=document_id,
             source_file=source.name,
             file_type=source.suffix.lower().lstrip("."),
@@ -148,6 +159,32 @@ class DocumentParser:
             created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             metadata={"warnings": []},
         )
+        if self.ocr_correction is not None and self.config.ocr_correction.enabled:
+            self.ocr_correction.begin_document(document.document_id)
+            self._active_correction_document_id = document.document_id
+        return document
+
+    def _finish_ocr_correction(self, document: ParsedDocument) -> None:
+        if self.ocr_correction is None or not self.config.ocr_correction.enabled:
+            return
+        stats = self.ocr_correction.finish_document(document.document_id)
+        document.metadata["ocr_correction"] = stats
+        if stats.get("fallback_count"):
+            self._warn(
+                document,
+                "ocr_correction",
+                f"OCR correction used raw-text fallback for {stats['fallback_count']} component(s)",
+            )
+
+    def _submit_ocr_correction(self, block: Block, label: str) -> None:
+        if self.ocr_correction is None or not self.config.ocr_correction.enabled:
+            return
+        block.metadata["ocr_text_raw"] = block.content
+        enabled_label = label in self.config.ocr_correction.correct_labels
+        if not enabled_label and not (label == "table" and self.config.ocr_correction.correct_tables):
+            block.metadata["ocr_correction"] = {"status": "skipped", "reason": "label_not_enabled"}
+            return
+        self.ocr_correction.submit(block, label)
 
     def _asset_dir(self, document_id: str) -> Path:
         target = self.config.asset_dir / document_id
@@ -236,6 +273,7 @@ class DocumentParser:
                 **kwargs,
             )
         )
+        self._submit_ocr_correction(image_block, "text")
         if vlm_result["output"] is not None:
             document.add_block(
                 self._block(
@@ -453,7 +491,7 @@ class DocumentParser:
 
         if not layout_blocks:
             if ocr_result["text"]:
-                document.add_block(
+                block = document.add_block(
                     self._block(
                         document,
                         "ocr_page",
@@ -465,6 +503,7 @@ class DocumentParser:
                         **common,
                     )
                 )
+                self._submit_ocr_correction(block, "text")
             elif "error" in ocr_result:
                 self._warn(document, "ocr", f"Scanned page {page_number} has no OCR output", page=page_number)
             return sections
@@ -480,7 +519,9 @@ class DocumentParser:
             if label in OCR_TABLE_LABELS:
                 rows = html_table_to_rows(content) if "<t" in content.lower() else markdown_table_to_rows(content)
                 if rows:
-                    self._add_table(document, rows, ordinal, section_path=list(sections), **common, **extra)
+                    block = self._add_table(document, rows, ordinal, section_path=list(sections), **common, **extra)
+                    if block is not None:
+                        self._submit_ocr_correction(block, "table")
                     continue
             if label in OCR_HEADING_LABELS:
                 text = clean_text(re.sub(r"^#+\s*", "", content))
@@ -493,9 +534,10 @@ class DocumentParser:
                 block_type = "chart" if label == "chart" else "image"
             else:
                 block_type = "text"
-            document.add_block(
+            block = document.add_block(
                 self._block(document, block_type, content, ordinal, section_path=list(sections), **common, **extra)
             )
+            self._submit_ocr_correction(block, label)
         return sections
 
     # -------------------------------------------------------------------- DOCX
