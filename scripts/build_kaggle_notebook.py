@@ -88,6 +88,8 @@ Notebook này chỉ làm **Ingestion**. Nó nhận file, folder Kaggle Dataset h
         """# Mỗi phần nhận trực tiếp Hugging Face model ID hoặc tên PaddleOCR.
 OCR_MODEL = "PaddleOCR-VL-1.6"
 VISION_MODEL = None  # Ví dụ: "Qwen/Qwen2.5-VL-3B-Instruct"
+# LLM sửa lỗi chính tả cho text OCR; chạy trên GPU còn trống khi parse. None để tắt.
+CORRECTION_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
 EMBEDDING_QUERY_INSTRUCTION = None
@@ -190,6 +192,9 @@ config.parsing.enable_ocr = OCR_MODEL is not None and OCR_PYTHON is not None
 config.vision.enabled = VISION_MODEL is not None
 if VISION_MODEL:
     config.vision.model = VISION_MODEL
+config.correction.enabled = CORRECTION_MODEL is not None and config.parsing.enable_ocr
+if CORRECTION_MODEL:
+    config.correction.model = CORRECTION_MODEL
 config.retrieval.dense_model = EMBEDDING_MODEL
 config.retrieval.dense_fallback_model = EMBEDDING_MODEL  # Không âm thầm đổi sang model khác.
 config.retrieval.dense_revision = EMBEDDING_REVISION

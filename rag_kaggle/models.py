@@ -109,6 +109,9 @@ class ChildChunk:
     token_count: int = 0
     parser_version: str = ""
     chunker_version: str = ""
+    # Document-profile terms that literally occur in this chunk (people, places, signers, ...).
+    keywords: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -128,6 +131,9 @@ class ChildChunk:
             "sheet_name": self.sheet_name,
             "cell_range": self.cell_range,
             "asset_path": self.asset_path,
+            "keywords": self.keywords,
+            "entities": self.entities,
+            "table_mode": self.metadata.get("table_mode"),
             "original_file_name": self.metadata.get("original_file_name", self.source_file),
             "uploaded_at": self.metadata.get("uploaded_at"),
             "content_hash": self.metadata.get("content_hash"),

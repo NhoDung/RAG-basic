@@ -126,6 +126,8 @@ class LocalQwen:
                     lines.append(f"page: {', '.join(map(str, pages[:5]))}")
                 if parent.section_path:
                     lines.append(f"section: {' > '.join(parent.section_path)}")
+            if item.get("document_info"):
+                lines.append(f"document_info: {item['document_info']}")
             lines.append(f"content:\n{item['content']}")
             block = "\n".join(lines)
             if current_chars + len(block) > self.config.generation.max_context_chars:
@@ -161,7 +163,13 @@ class LocalQwen:
             "prompt_context": "\n\n".join(context_parts),
         }
 
-    def _chat(self, system_prompt: str, user_prompt: str, max_new_tokens: int | None = None) -> str:
+    def _chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_new_tokens: int | None = None,
+        repetition_penalty: float | None = None,
+    ) -> str:
         import torch
 
         self.load()
@@ -179,7 +187,8 @@ class LocalQwen:
         generation_kwargs = {
             "max_new_tokens": max_new_tokens or self.config.generation.max_new_tokens,
             "do_sample": do_sample,
-            "repetition_penalty": 1.05,
+            # Answering benefits from a mild penalty; verbatim-copy tasks (OCR correction) pass 1.0.
+            "repetition_penalty": 1.05 if repetition_penalty is None else repetition_penalty,
         }
         if do_sample:
             generation_kwargs["temperature"] = self.config.generation.temperature

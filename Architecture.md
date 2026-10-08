@@ -49,7 +49,8 @@ vision-language model và LLM được chạy trực tiếp trong Kaggle Noteboo
 | Inference | Self-host trong notebook, không gọi API bên ngoài |
 | Ngôn ngữ chính | Tiếng Việt, có thể xen lẫn tiếng Anh |
 | Vector database | Qdrant local/embedded mode |
-| Chunking | Parent-child, có nhận biết layout và modality |
+| Chunking | Structure-aware: 1 đoạn/câu, 1 ảnh, 1 bảng = 1 chunk; mục (section) dùng để mở rộng ngữ cảnh |
+| Hiệu đính OCR | LLM (mặc định Qwen2.5-7B 4-bit) trên GPU trống khi parse, ngữ cảnh độc lập từng đoạn |
 | Dense retrieval | `BAAI/bge-multilingual-gemma2` |
 | Sparse retrieval | BM25 |
 | Fusion | Reciprocal Rank Fusion (RRF) |
@@ -93,12 +94,22 @@ sơ đồ kỹ thuật đầy đủ được đặt trong mục thu gọn ở cu
 Ý chính: parser chuyên dụng lấy dữ liệu chính xác; VLM chỉ xử lý phần cần hiểu bằng
 thị giác, không đọc lại toàn bộ tài liệu.
 
-### 2.3. Parent-child chunking hoạt động ra sao?
+### 2.3. Structure-aware chunking hoạt động ra sao?
 
-![Minh họa Parent-child chunking](./docs/diagrams/03-parent-child.png)
+> Sơ đồ `docs/diagrams/03-parent-child.png` mô tả chiến lược cũ (Parent-Child) và chưa được vẽ lại.
+> Mô tả hiện hành nằm ở mục 6.
 
-Child nhỏ để tìm đúng. Parent lớn hơn để trả lời không mất ngữ cảnh. Hệ thống
-không đưa toàn bộ parent vào prompt nếu các phần còn lại không liên quan.
+Chunk bám theo cấu trúc tài liệu thay vì cắt theo cửa sổ cố định: một đoạn (hoặc nhóm câu)
+là một chunk, một ảnh là một chunk, một bảng là một chunk. Bảng nhỏ giữ nguyên dạng Markdown;
+bảng lớn được lưu đầy đủ trong file `.xlsx` và chunk chỉ giữ phần xem trước. Mục (section) không
+được embedding; nó chỉ dùng để mở rộng ngữ cảnh sau retrieval.
+
+### 2.3b. Hiệu đính OCR bằng LLM
+
+Khi parse trang scan, PaddleOCR-VL chạy trên GPU 1 còn GPU 0 để trống. Một LLM thứ hai được nạp lên
+GPU 0 để sửa lỗi chính tả của text OCR. Mỗi lần gọi là độc lập và chỉ chứa: chỉ dẫn hệ thống, glossary
+của tài liệu, đoạn liền trước (đã sửa, tối đa 1 trang trước) và đoạn cần sửa. LLM được giải phóng
+trước khi embedding bắt đầu.
 
 ### 2.4. Một câu hỏi đi qua retrieval như thế nào?
 
@@ -147,10 +158,10 @@ flowchart LR
     C3 --> D
 
     D --> E[Document graph]
-    E --> F[Parent context units]
-    F --> G1[Text child chunks]
-    F --> G2[Table child chunks]
-    F --> G3[Image/chart child chunks]
+    E --> F[Sections theo heading]
+    F --> G1[Text chunks: 1 đoạn]
+    F --> G2[Table chunks: 1 bảng hoặc preview + xlsx]
+    F --> G3[Image/chart chunks: 1 ảnh]
 
     G1 --> H[Dense + sparse embedding]
     G2 --> H
@@ -165,7 +176,7 @@ flowchart LR
     L1 --> M[RRF fusion]
     L2 --> M
     M --> N[Reranker]
-    N --> O[Parent and relation expansion]
+    N --> O[Section/neighbor and relation expansion]
     O --> P[Context builder]
     P --> Q[Qwen answer]
     Q --> R[Answer + citations]
@@ -186,7 +197,7 @@ flowchart TB
         PDF --> OCR[PaddleOCR-VL]
         DOCX --> OCR
         XLSX --> OCR
-        OCR --> CHUNK[Parent-child chunker]
+        OCR --> CHUNK[Structure-aware chunker]
         OCR -. complex visual logic .-> VLM[Optional vision model]
         PDF --> CHUNK
         DOCX --> CHUNK
@@ -220,7 +231,7 @@ sequenceDiagram
     participant Parser as Format parser
     participant Media as PaddleOCR-VL / optional VLM
     participant Graph as Document graph
-    participant Chunker as Parent-child chunker
+    participant Chunker as Structure-aware chunker
     participant Encoder as Embedding/BM25
     participant Store as Qdrant + structured storage
 
@@ -244,9 +255,9 @@ sequenceDiagram
     Parser->>Graph: Canonical blocks + relationships
     Graph->>Graph: Nối caption, reference, table và chart source
     Graph->>Chunker: Document graph hoàn chỉnh
-    Chunker->>Chunker: Tạo parent và modality-aware children
-    Chunker->>Store: Lưu parent, block, table rows và assets
-    Chunker->>Encoder: Child contents
+    Chunker->>Chunker: Tạo section và chunk theo từng phần tử cấu trúc
+    Chunker->>Store: Lưu section, block, table rows, file xlsx và assets
+    Chunker->>Encoder: Chunk contents
     Encoder->>Encoder: Dense vectors + BM25 sparse vectors
     Encoder->>Store: Batch upsert Qdrant
     Store-->>UI: Manifest và trạng thái ingestion/progress
@@ -262,8 +273,8 @@ flowchart LR
     DOC --> SEC[Sections and sheets]
     SEC --> BLOCK[Canonical blocks]
     BLOCK --> REL[Block relationships]
-    BLOCK --> PARENT[Parent context units]
-    PARENT --> CHILD[Child chunks]
+    BLOCK --> PARENT[Sections]
+    PARENT --> CHILD[Chunks]
 
     BLOCK -->|table rows| TABLE[(JSON or Parquet)]
     BLOCK -->|metadata and graph| SQLITE[(SQLite)]
@@ -272,7 +283,7 @@ flowchart LR
     CHILD -->|dense and sparse vectors| QDRANT[(Qdrant rag_chunks)]
     CHILD -->|parent_id and block_ids| QDRANT
 
-    QDRANT --> HIT[Retrieved child]
+    QDRANT --> HIT[Retrieved chunk]
     HIT -->|parent_id| SQLITE
     SQLITE --> CONTEXT[Expanded context]
     TABLE --> CONTEXT
@@ -327,22 +338,21 @@ sequenceDiagram
     App-->>User: Answer + citations + source preview
 ```
 
-### 2.12. Sơ đồ Parent-child và context expansion
+### 2.12. Sơ đồ section và context expansion
 
 ```mermaid
 flowchart TB
-    subgraph P["Parent: Quy trình phê duyệt khoản vay"]
+    subgraph P["Section: Quy trình phê duyệt khoản vay"]
         B1[Đoạn mô tả quy trình]
         B2[Flowchart nodes and edges]
         B3[Bảng điều kiện phê duyệt]
         B4[Caption và ghi chú]
     end
 
-    B1 --> C1[Text child]
-    B2 --> C2[Flowchart child]
-    B3 --> C3[Table rows child 1]
-    B3 --> C4[Table rows child 2]
-    B4 --> C5[Caption child]
+    B1 --> C1[Text chunk]
+    B2 --> C2[Flowchart chunk]
+    B3 --> C3[Table chunk: 1 bảng hoặc preview + xlsx]
+    B4 --> C5[Caption gắn vào chunk của bảng/ảnh]
 
     Q["Query: CIC không đạt thì xử lý thế nào?"] --> R[Hybrid retrieval]
     R --> C2
@@ -648,74 +658,51 @@ Các loại quan hệ tối thiểu:
 Document graph có thể lưu bằng JSON hoặc các bảng SQLite; baseline không cần graph
 database riêng.
 
-## 6. Parent-child chunking
+## 6. Structure-aware chunking
 
-### 6.1. Parent context unit
+### 6.1. Section (đơn vị mở rộng ngữ cảnh)
 
-Parent là một đơn vị nghiệp vụ hoàn chỉnh, thường tương ứng với một section hoặc
-một logical table/dashboard. Parent có thể chứa nhiều modality:
+Section là đoạn tài liệu liên tục nằm dưới cùng một heading (hoặc cùng sheet/trang khi không có heading).
+Nó chứa nhiều modality (đoạn văn, bảng, ảnh, caption) và được lưu trong bảng `parents` của SQLite. Section
+không được embedding; nó chỉ được dùng để cho mô hình trả lời thấy ngữ cảnh xung quanh chunk trúng truy vấn.
 
-```text
-Section title
-Đoạn giải thích
-Mô tả flowchart liên quan
-Bảng điều kiện hoặc biểu phí liên quan
-Caption và ghi chú
-```
+Một section tối đa `section_max_chars` (mặc định 7.500 ký tự). Bảng lớn chỉ đóng góp phần xem trước vào section,
+không đóng góp toàn bộ bảng.
 
-Parent không nhất thiết được embedding. Nó được lưu trong structured storage để
-mở rộng context sau retrieval.
+### 6.2. Chunk = một phần tử cấu trúc
 
-Kích thước mục tiêu: khoảng 1.000-2.500 tokens. Nếu section lớn hơn, chia theo
-subheading, semantic boundary hoặc nhóm block liên quan.
+| Phần tử | Chunk |
+|---|---|
+| Đoạn văn / câu | 1 chunk. Đoạn ngắn hơn `min_text_chars` được gộp với đoạn kế tiếp cùng mục. Đoạn dài hơn `max_text_chars` mới bị tách, và chỉ tách ở ranh giới câu |
+| Bảng nhỏ | 1 chunk chứa toàn bộ bảng dạng Markdown (kèm title, ghi chú, đoạn tham chiếu). Không bao giờ cắt theo hàng hoặc cột |
+| Bảng lớn (> `table_inline_max_rows` hàng hoặc > `table_inline_max_chars` ký tự) | 1 chunk xem trước: kích thước bảng, tên tất cả cột, N hàng đầu x M cột đầu, danh sách giá trị cột đầu tiên, đường dẫn file `.xlsx`. Bảng đầy đủ nằm trong `tables/<document_id>/<block_id>.xlsx` và trong `blocks.rows` |
+| Ảnh / flowchart / chart | 1 chunk: caption, OCR text, mô tả VLM, đoạn văn tham chiếu |
+| KPI | 1 chunk |
 
-### 6.2. Child chunks
+Không còn overlap giữa các chunk văn bản. Tính liên tục được bảo đảm lúc retrieval: nếu section lớn hơn
+`max_parent_chars_in_context`, context gồm chunk trúng và `max_neighbor_chunks` chunk liền trước/sau trong
+cùng section.
 
-Child là đơn vị được embedding và index trong Qdrant.
+Với bảng lớn, khi chunk xem trước trúng truy vấn, `expand_context` đọc bảng đầy đủ từ SQLite và đưa vào prompt
+các dòng khớp câu hỏi nhất (tối đa `max_table_rows_in_context`, chấm điểm theo từ hiếm), không đưa cả bảng.
 
-#### Text child
+### 6.2b. Metadata của tài liệu
 
-- Chia theo heading -> paragraph -> sentence/token.
-- Mục tiêu 350-500 tokens.
-- Overlap 50-80 tokens.
-- Không cắt ngang bullet list, điều khoản hoặc câu tham chiếu đến hình/bảng.
-- Prepend document title và section path trước khi embed.
-
-#### Table child
-
-- Bảng nhỏ được giữ nguyên.
-- Bảng lớn chia khoảng 10-20 rows/chunk.
-- Luôn lặp lại table title, column header, đơn vị và key columns.
-- Bảng quá rộng được chia theo nhóm cột nhưng phải lặp lại cột định danh.
-- Không dùng token splitter chung để cắt giữa một row.
-
-#### Image/flowchart child
-
-Nội dung để embed gồm:
-
-- Figure title/caption.
-- OCR text.
-- VLM summary.
-- Danh sách node và edge đối với flowchart.
-- Section path và đoạn text trực tiếp tham chiếu đến hình.
-
-#### Chart child
-
-Nội dung để embed gồm chart title, chart type, axis, legend, source data tóm gọn và
-nhận xét. Source data và nhận xét phải được đánh dấu riêng.
-
-#### KPI child
-
-Các KPI gần nhau trong dashboard được nhóm thành một chunk có chung title, đơn vị
-và phạm vi cell. Không biến mỗi cell thành một vector riêng.
+Sau khi parse, mỗi tài liệu có một profile: tiêu đề, số hiệu, ngày, người ký, người/địa danh/tổ chức/sự vụ
+được nhắc tới và từ khóa. Profile lấy từ quy tắc (không cần model) và từ glossary của bước hiệu đính OCR.
+Nó được lưu trong `documents.payload_json` (`metadata.profile`). Mỗi chunk lưu `entities` và `keywords` xuất hiện
+trong chính chunk đó (cũng nằm trong payload Qdrant), và `Entities: ...` được thêm vào phần đầu nội dung
+chunk để dense và BM25 cùng thấy. Khi câu hỏi nêu tên một entity đã biết, `entity_search` thêm một bảng xếp hạng
+vào RRF (tín hiệu mềm, không loại chunk nào). Profile cũng được in thành dòng `document_info` cạnh mỗi nguồn
+trong prompt trả lời.
 
 ### 6.3. Chunk schema
 
 ```json
 {
-  "chunk_id": "doc_parent_table_rows_001_015",
+  "chunk_id": "doc_section_table_007",
   "document_id": "doc_001",
-  "parent_id": "parent_002",
+  "parent_id": "section_002",
   "block_ids": ["block_010", "block_011"],
   "chunk_type": "text|table|image|chart|flowchart|kpi",
   "content": "Nội dung đã chuẩn hóa để embed",
@@ -727,7 +714,11 @@ và phạm vi cell. Không biến mỗi cell thành một vector riêng.
   "cell_range": "A4:E19",
   "asset_path": null,
   "token_count": 412,
+  "keywords": ["QĐ-123"],
+  "entities": ["Nguyễn Văn A"],
   "metadata": {
+    "table_mode": "inline|preview",
+    "xlsx_path": "tables/doc_001/block_010.xlsx",
     "original_file_name": "bao_cao_2025.xlsx",
     "uploaded_at": "2026-10-07T10:15:30+00:00",
     "content_hash": "..."
@@ -846,8 +837,8 @@ hiệu quan trọng trong tài liệu ngân hàng.
 
 ```text
 Canonical blocks
-  -> build parent units
-  -> build child chunks
+  -> build sections
+  -> build structure-aware chunks
   -> dense encode
   -> BM25 sparse encode
   -> validate vector and payload
@@ -910,14 +901,14 @@ Giá trị khởi đầu: `k = 60`. Sau RRF giữ khoảng 20-30 child candidate
 - Preset T4 x2 chạy reranker FP32 trên CPU; batch size điều chỉnh theo RAM và latency.
 - Có thể tắt reranker bằng config để benchmark latency/quality.
 
-### 9.4. Parent và relation expansion
+### 9.4. Section và relation expansion
 
-Với mỗi child được chọn:
+Với mỗi chunk được chọn:
 
-1. Truy vấn parent bằng `parent_id`.
+1. Truy vấn section bằng `parent_id` (nếu section quá lớn: chunk trúng cùng chunk liền trước/sau).
 2. Lấy các block gốc tạo ra child.
 3. Lấy caption, referenced image/table hoặc chart source có quan hệ trực tiếp.
-4. Với bảng, chỉ lấy các row liên quan cộng header/title/note.
+4. Với bảng lớn (chunk xem trước), lấy các row khớp câu hỏi nhất cộng header/title/note.
 5. Deduplicate theo block ID và content hash.
 6. Sắp xếp theo document, section và reading order.
 7. Cắt context theo token budget.
@@ -1162,12 +1153,24 @@ ocr:
   batch_size: 1
   preserve_raw_output: true
 
+correction:
+  enabled: true
+  model: Qwen/Qwen2.5-7B-Instruct
+  device: cuda:0              # GPU trống khi parse; PaddleOCR-VL ở GPU 1
+  context_chars: 1200
+  context_blocks: 1
+  max_pages_back: 1
+  use_document_memory: true
+
 chunking:
-  strategy: parent_child
-  text_chunk_tokens: 450
-  text_overlap_tokens: 60
-  table_rows_per_chunk: 15
-  parent_max_tokens: 2500
+  strategy: structure_aware
+  max_text_chars: 1800
+  min_text_chars: 120
+  table_inline_max_chars: 6000
+  table_inline_max_rows: 60
+  table_preview_rows: 5
+  table_preview_columns: 5
+  section_max_chars: 7500
 
 embedding:
   model: BAAI/bge-multilingual-gemma2
@@ -1283,8 +1286,8 @@ rag-basic/
 4. Chạy OCR/VLM cho các block cần thiết.
 5. Chuẩn hóa thành Canonical Document Model.
 6. Xây document graph và relationships.
-7. Tạo parent context units.
-8. Tạo child chunks theo từng modality.
+7. Tạo section (đơn vị mở rộng ngữ cảnh) và document profile.
+8. Tạo chunk theo từng phần tử cấu trúc; ghi bảng lớn ra .xlsx.
 9. Lưu structured data và assets.
 10. Sinh dense/sparse vectors.
 11. Upsert Qdrant.
@@ -1308,7 +1311,7 @@ rag-basic/
 
 1. Canonical data model và storage layout.
 2. PDF text, DOCX text/table và Excel table parsing.
-3. Parent-child chunking.
+3. Structure-aware chunking.
 4. Dense retrieval và Qdrant.
 5. BM25 và RRF.
 6. Qwen answer với citation.

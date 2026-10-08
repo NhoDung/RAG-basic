@@ -11,14 +11,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .chunking import table_header_and_body
 from .config import PipelineConfig
 from .models import Block, ChildChunk, ParentContext, ParsedDocument, Relationship, StageStatus
-from .utils import text_sha1
+from .utils import normalize_for_match, text_sha1
 
 
 LOGGER = logging.getLogger(__name__)
 DENSE_VECTOR_NAME = "dense"
-FILTER_FIELDS = ("document_id", "chunk_type", "source_file", "sheet_name")
+FILTER_FIELDS = ("document_id", "chunk_type", "source_file", "sheet_name", "entities")
 
 
 class MetadataStore:
@@ -267,6 +268,11 @@ class MetadataStore:
                 "SELECT DISTINCT json_extract(payload_json, '$.chunk_type') FROM chunks ORDER BY 1"
             ).fetchall()
             return [row[0] for row in rows if row[0]]
+        if field == "entity":
+            rows = self.connection.execute(
+                "SELECT DISTINCT value FROM chunks, json_each(chunks.payload_json, '$.entities') ORDER BY 1"
+            ).fetchall()
+            return [row[0] for row in rows if row[0]]
         raise ValueError(field)
 
     def get_parent(self, parent_id: str) -> ParentContext | None:
@@ -274,6 +280,17 @@ class MetadataStore:
             "SELECT payload_json FROM parents WHERE parent_id = ?", (parent_id,)
         ).fetchone()
         return ParentContext(**json.loads(row[0])) if row else None
+
+    def chunks_in_parent(self, parent_id: str) -> list[ChildChunk]:
+        """Chunks of one section in reading order (insertion order)."""
+        rows = self.connection.execute(
+            "SELECT payload_json FROM chunks WHERE parent_id = ? ORDER BY rowid", (parent_id,)
+        ).fetchall()
+        return [ChildChunk(**json.loads(row[0])) for row in rows]
+
+    def get_document_profile(self, document_id: str) -> dict:
+        document = self.get_document(document_id) or {}
+        return (document.get("metadata") or {}).get("profile") or {}
 
     def get_chunk(self, chunk_id: str) -> ChildChunk | None:
         row = self.connection.execute(
@@ -589,6 +606,34 @@ class HybridIndex:
                 break
         return results
 
+    def entity_search(self, query: str, limit: int, filters: dict[str, Any] | None = None) -> list[str]:
+        """Chunks tagged with an entity the question mentions, best BM25 match first.
+
+        A soft signal fused with dense/sparse by RRF: a question naming "Nguyễn Văn A"
+        pulls up the chunks about that person without excluding anything else.
+        """
+        self.open()
+        if self.bm25 is None:
+            return []
+        normalized_query = normalize_for_match(query)
+        mentioned = {
+            entity
+            for fields in self.bm25_fields
+            for entity in (fields.get("entities") or [])
+            if len(entity) >= 3 and re.search(r"(?<!\w)" + re.escape(normalize_for_match(entity)) + r"(?!\w)", normalized_query)
+        }
+        if not mentioned:
+            return []
+        scores = self.bm25.get_scores(tokenize_vi(query))
+        candidates = [
+            index
+            for index, fields in enumerate(self.bm25_fields)
+            if mentioned.intersection(fields.get("entities") or [])
+            and (not filters or _matches_filters(fields, filters))
+        ]
+        candidates.sort(key=lambda index: (-scores[index], index))
+        return [self.bm25_chunk_ids[index] for index in candidates[:limit]]
+
     def close(self):
         if self.client is not None:
             self.client.close()
@@ -620,9 +665,21 @@ class HybridIndex:
 
         self.bm25_chunk_ids = [chunk.chunk_id for chunk in chunks]
         self.bm25_fields = [{field: getattr(chunk, field) for field in FILTER_FIELDS} for chunk in chunks]
-        self.bm25 = BM25Okapi([tokenize_vi(chunk.content) for chunk in chunks])
+        self.bm25 = BM25Okapi([tokenize_vi(self._sparse_text(chunk)) for chunk in chunks])
         with self.config.bm25_path.open("wb") as stream:
             pickle.dump({"ids": self.bm25_chunk_ids, "fields": self.bm25_fields, "index": self.bm25}, stream)
+
+    def _sparse_text(self, chunk: ChildChunk) -> str:
+        """Text indexed by BM25. A large table is embedded as a short preview, but a keyword that
+        names any of its rows (the first column: code, name, branch, ...) must still find it."""
+        if chunk.metadata.get("table_mode") != "preview" or not chunk.block_ids:
+            return chunk.content
+        block = self.metadata.get_block(chunk.block_ids[0])
+        if block is None:
+            return chunk.content
+        _, body = table_header_and_body(block)
+        keys = dict.fromkeys(row[0] for row in body if row and row[0])
+        return chunk.content + "\n" + "\n".join(keys)
 
     def _load_bm25(self):
         if self.bm25 is not None or not self.config.bm25_path.exists():
@@ -639,7 +696,11 @@ def _matches_filters(fields: dict[str, Any], filters: dict[str, Any]) -> bool:
         if expected in (None, "", []):
             continue
         values = expected if isinstance(expected, (list, tuple, set)) else [expected]
-        if fields.get(key) not in values:
+        actual = fields.get(key)
+        if isinstance(actual, (list, tuple, set)):  # e.g. entities: any overlap matches
+            if not set(actual).intersection(values):
+                return False
+        elif actual not in values:
             return False
     return True
 

@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 
-PARSER_VERSION = "0.2.0"
-CHUNKER_VERSION = "0.2.0"
+PARSER_VERSION = "0.3.0"
+CHUNKER_VERSION = "0.3.0"
 ARTIFACT_SCHEMA_VERSION = 1
 
 
@@ -41,6 +41,9 @@ class ParsingConfig:
     heading_font_ratio: float = 1.15
     heading_max_chars: int = 160
     write_table_parquet: bool = True
+    # Large tables are never split into several chunks: the full table goes to an
+    # .xlsx file and the chunk keeps only a preview (see ChunkingConfig).
+    write_table_excel: bool = True
     libreoffice_binary: str | None = None
 
 
@@ -59,13 +62,64 @@ class VisionConfig:
 
 
 @dataclass
+class CorrectionConfig:
+    """LLM spelling correction of OCR text (runs on the GPU the OCR worker does not use).
+
+    Every call is stateless: system instruction + document glossary + the previous
+    (already corrected) paragraph + the paragraph being fixed. Nothing accumulates
+    in the model context between paragraphs.
+    """
+
+    enabled: bool = False
+    model: str = "Qwen/Qwen2.5-7B-Instruct"
+    revision: str | None = None
+    load_in_4bit: bool = True
+    # Set by the Kaggle device planner. None delegates placement to Transformers.
+    device: str | None = None
+    max_new_tokens: int = 1024
+    # Longer OCR blocks are corrected in segments of at most this many characters.
+    segment_chars: int = 1500
+    # Tail of the previous corrected text shown as read-only context.
+    context_chars: int = 1200
+    context_blocks: int = 1
+    # Never look further back than this many pages (1 = the page before the current one).
+    max_pages_back: int = 1
+    min_chars: int = 12
+    # Terms (people, places, signers, ...) collected while parsing one document and
+    # fed back so the same entity is always spelled the same way.
+    use_document_memory: bool = True
+    memory_max_items_per_kind: int = 30
+    memory_max_chars: int = 800
+    memory_similarity: float = 0.9
+    # A correction is rejected (the original text is kept) when it changes too much.
+    min_similarity: float = 0.6
+    max_length_change: float = 0.35
+    max_consecutive_failures: int = 3
+
+
+@dataclass
 class ChunkingConfig:
-    child_chars: int = 1800
-    child_overlap_chars: int = 240
-    parent_chars: int = 7500
-    table_rows_per_chunk: int = 15
-    table_max_columns_per_chunk: int = 8
-    table_key_columns: int = 1
+    """Structure-aware chunking: one chunk per structural element.
+
+    paragraph / sentence group -> 1 chunk, image -> 1 chunk, table -> 1 chunk (Markdown),
+    or a preview chunk + a full .xlsx file when the table is too large to inline.
+    """
+
+    strategy: str = "structure_aware"
+    # A paragraph longer than this is split on sentence boundaries (never mid-sentence).
+    max_text_chars: int = 1800
+    # Consecutive paragraphs of one section are merged while the buffer is shorter than this.
+    min_text_chars: int = 120
+    # Tables above either limit become "preview chunk + xlsx" instead of Markdown.
+    table_inline_max_chars: int = 6000
+    table_inline_max_rows: int = 60
+    table_preview_rows: int = 5
+    table_preview_columns: int = 5
+    table_key_values_chars: int = 600
+    # Image/chart/flowchart/KPI elements stay in one chunk up to this size (embedding-input safety cap).
+    max_element_chars: int = 8000
+    # Safety cap for one structural section (the unit used for context expansion).
+    section_max_chars: int = 7500
     chars_per_token: float = 3.6
 
 
@@ -94,6 +148,9 @@ class RetrievalConfig:
     expand_relationships: bool = True
     max_related_blocks: int = 6
     max_parent_chars_in_context: int = 6000
+    # Large tables are answered from the rows that best match the question.
+    max_table_rows_in_context: int = 30
+    max_neighbor_chunks: int = 1
 
 
 @dataclass
@@ -143,6 +200,7 @@ class PipelineConfig:
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     parsing: ParsingConfig = field(default_factory=ParsingConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    correction: CorrectionConfig = field(default_factory=CorrectionConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)

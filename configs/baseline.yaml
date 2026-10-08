@@ -19,6 +19,7 @@ parsing:
   include_hidden_sheets: false
   include_hidden_rows_columns: false
   write_table_parquet: true
+  write_table_excel: true      # Bảng lớn: lưu cả bảng ra .xlsx, chunk chỉ giữ phần xem trước
 
 vision:
   enabled: false               # Bật khi evaluation cho thấy cần hiểu flowchart/dashboard
@@ -28,13 +29,30 @@ vision:
   max_retries: 2
   device: null                   # Notebook tự chọn GPU 0 khi T4 x2
 
+correction:
+  # Sửa lỗi chính tả OCR bằng LLM trên GPU mà PaddleOCR không dùng. Mỗi lần gọi độc lập:
+  # system + glossary + đoạn liền trước (đã sửa, tối đa 1 trang trước) + đoạn cần sửa.
+  enabled: true
+  model: Qwen/Qwen2.5-7B-Instruct
+  load_in_4bit: true
+  device: null                   # Notebook tự chọn GPU 0 khi T4 x2
+  segment_chars: 1500
+  context_chars: 1200
+  context_blocks: 1
+  max_pages_back: 1
+  use_document_memory: true      # Glossary tên người/địa danh/người ký trong 1 tài liệu
+  memory_max_chars: 800
+
 chunking:
-  child_chars: 1800            # ~450 tokens
-  child_overlap_chars: 240     # ~60 tokens
-  parent_chars: 7500           # ~2000 tokens
-  table_rows_per_chunk: 15
-  table_max_columns_per_chunk: 8
-  table_key_columns: 1
+  # Structure-aware: 1 đoạn/câu = 1 chunk, 1 ảnh = 1 chunk, 1 bảng = 1 chunk.
+  strategy: structure_aware
+  max_text_chars: 1800         # ~450 tokens; đoạn dài hơn mới bị tách, và chỉ tách ở ranh giới câu
+  min_text_chars: 120          # đoạn quá ngắn được gộp với đoạn kế tiếp cùng mục
+  table_inline_max_chars: 6000 # bảng lớn hơn -> chunk xem trước + file .xlsx đầy đủ
+  table_inline_max_rows: 60
+  table_preview_rows: 5
+  table_preview_columns: 5
+  section_max_chars: 7500      # ~2000 tokens; giới hạn an toàn cho một mục (đơn vị mở rộng ngữ cảnh)
 
 retrieval:
   # Mục tiêu kiến trúc là BAAI/bge-multilingual-gemma2 (cần query instruction),

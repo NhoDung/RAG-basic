@@ -14,9 +14,10 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
-from .chunking import ParentChildChunker
+from .chunking import StructureAwareChunker
 from .computation import compute_from_blocks
 from .config import ARTIFACT_SCHEMA_VERSION, CHUNKER_VERSION, PARSER_VERSION, PipelineConfig
+from .correction import OCRCorrector
 from .generation import LocalQwen
 from .guardrails import (
     REFUSAL_TEXT,
@@ -25,9 +26,10 @@ from .guardrails import (
     unsupported_numbers,
 )
 from .ingestion import IngestionError, discover_input_files, validate_file
+from .knowledge import build_document_profile
 from .models import StageStatus
 from .paddleocr_vl import PaddleOCRVLAdapter
-from .parsers import DocumentParser, save_parsed_document, save_table_parquet
+from .parsers import DocumentParser, save_parsed_document, save_table_excel, save_table_parquet
 from .relationships import build_relationships
 from .retrieval import HybridRetriever, Reranker
 from .storage import DenseEncoder, HybridIndex, MetadataStore
@@ -66,10 +68,11 @@ class RAGPipeline:
                 cuda_visible_devices=self.config.parsing.ocr_cuda_visible_devices,
             )
             self.vision = VisionReasoner(self.config)
-            self.parser = DocumentParser(self.config, self.ocr, self.vision)
-            self.chunker = ParentChildChunker(self.config.chunking)
+            self.corrector = OCRCorrector(self.config)
+            self.parser = DocumentParser(self.config, self.ocr, self.vision, self.corrector)
+            self.chunker = StructureAwareChunker(self.config.chunking)
         else:
-            self.ocr = self.vision = self.parser = self.chunker = None
+            self.ocr = self.vision = self.corrector = self.parser = self.chunker = None
         if mode in ("full", "retrieval"):
             self.reranker = Reranker(self.config)
             self.generator = LocalQwen(self.config)
@@ -233,7 +236,10 @@ class RAGPipeline:
 
                 stage_started = time.perf_counter()
                 build_relationships(document)
-                parents, chunks = self.chunker.chunk(document)
+                document.metadata["profile"] = build_document_profile(document)
+                if self.config.parsing.write_table_excel:
+                    save_table_excel(document, self.config.table_dir, self.config.chunking)
+                parents, chunks = self.chunker.chunk(document, document.metadata["profile"])
                 version_metadata = {
                     "original_file_name": name,
                     "uploaded_at": uploaded_at,
@@ -260,6 +266,7 @@ class RAGPipeline:
                         "relationships": len(document.relationships),
                         "parents": len(parents),
                         "chunks": len(chunks),
+                        "ocr_correction": _correction_summary(document),
                         "warnings": warnings,
                         "has_macros": facts.get("has_macros", False),
                     }
@@ -274,6 +281,7 @@ class RAGPipeline:
 
         self.ocr.unload()
         self.vision.unload()
+        self.corrector.unload()  # Free the GPU before dense embedding starts.
 
         if new_chunks or reset:
             started = time.perf_counter()
@@ -312,6 +320,7 @@ class RAGPipeline:
             "dense_dimension": self.metadata.get_setting("index.dimension"),
             "ocr_model": self.config.parsing.ocr_model_name,
             "vlm_model": self.config.vision.model if self.config.vision.enabled else None,
+            "ocr_correction_model": self.config.correction.model if self.config.correction.enabled else None,
             "parser_version": PARSER_VERSION,
             "chunker_version": CHUNKER_VERSION,
             "chunking": self.config.to_dict()["chunking"],
@@ -385,7 +394,7 @@ class RAGPipeline:
             }
 
         with trace.stage("expand_context"):
-            contexts = self.retriever.expand_context(hits)
+            contexts = self.retriever.expand_context(hits, query=query)
         for context in contexts:
             if guard.enabled and guard.detect_prompt_injection and detect_prompt_injection(context["content"]):
                 warnings.append(f"{context['citation']} chứa đoạn văn giống chỉ dẫn hệ thống; đã được xử lý như dữ liệu.")
@@ -502,6 +511,7 @@ class RAGPipeline:
             "models": {
                 "ocr": self.config.parsing.ocr_model_name,
                 "vision": self.config.vision.model if self.config.vision.enabled else None,
+                "ocr_correction": self.config.correction.model if self.config.correction.enabled else None,
             },
             "versions": {"parser": PARSER_VERSION, "chunker": CHUNKER_VERSION},
             "chunking": self.config.to_dict()["chunking"],
@@ -719,6 +729,14 @@ def _hit_row(hit) -> dict:
         "asset_path": hit.chunk.asset_path,
         "preview": hit.chunk.content[:500],
     }
+
+
+def _correction_summary(document) -> dict | None:
+    """Counters of the OCR correction pass (the glossary itself stays in the document metadata)."""
+    info = document.metadata.get("ocr_correction")
+    if not info:
+        return None
+    return {key: value for key, value in info.items() if key != "memory"}
 
 
 def _count_statuses(statuses: list[dict]) -> dict[str, int]:

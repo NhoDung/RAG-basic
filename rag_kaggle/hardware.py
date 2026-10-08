@@ -66,9 +66,12 @@ def configure_ingestion_devices(config: PipelineConfig, gpu_count: int | None = 
         config.parsing.ocr_cuda_visible_devices = "1"
         config.retrieval.dense_device = "cuda:0"
         config.vision.device = "cuda:0"
+        # GPU 0 is idle while pages are parsed: host the OCR-correction LLM there. It is
+        # unloaded before dense embedding starts, so the two never compete for memory.
+        config.correction.device = "cuda:0"
         return {
             "mode": "ingestion_dual_gpu",
-            "gpu_0": ["dense embedding", "optional vision model (sequential)"],
+            "gpu_0": ["OCR correction LLM (during parsing)", "optional vision model", "dense embedding (after parsing)"],
             "gpu_1": ["PaddleOCR-VL worker"],
             "cpu": ["parsing", "chunking", "Qdrant", "BM25", "metadata"],
         }
@@ -76,10 +79,19 @@ def configure_ingestion_devices(config: PipelineConfig, gpu_count: int | None = 
         config.parsing.ocr_cuda_visible_devices = "0"
         config.retrieval.dense_device = "cuda:0"
         config.vision.device = "cuda:0"
-        return {"mode": "ingestion_single_gpu", "gpu_0": ["OCR", "vision", "embedding (sequential)"]}
+        config.correction.device = "cuda:0"
+        return {
+            "mode": "ingestion_single_gpu",
+            "gpu_0": ["OCR", "OCR correction LLM", "vision", "embedding (sequential)"],
+            "warning": "OCR and the correction LLM share one GPU; disable correction if memory runs out.",
+        }
     config.retrieval.dense_device = "cpu"
     config.vision.device = None
-    return {"mode": "ingestion_cpu_only", "warning": "No CUDA GPU was detected."}
+    config.correction.enabled = False  # A 7B model on CPU is impractical.
+    return {
+        "mode": "ingestion_cpu_only",
+        "warning": "No CUDA GPU was detected; OCR correction was disabled.",
+    }
 
 
 def configure_retrieval_devices(config: PipelineConfig, gpu_count: int | None = None) -> dict[str, Any]:

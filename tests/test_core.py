@@ -6,19 +6,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rag_kaggle.chunking import ParentChildChunker, split_text
+from rag_kaggle.chunking import StructureAwareChunker, split_text
 from rag_kaggle.computation import compute_from_blocks, detect_operation
-from rag_kaggle.config import ChunkingConfig, PipelineConfig
+from rag_kaggle.config import ChunkingConfig, CorrectionConfig, PipelineConfig
+from rag_kaggle.correction import DocumentMemory, OCRCorrector, accept_correction, parse_response
 from rag_kaggle.evaluation import answer_correct, hit_matches, retrieval_metrics
 from rag_kaggle.generation import parse_answer, sanitize_plan
 from rag_kaggle.guardrails import detect_prompt_injection, mask_pii, sanitize_context, unsupported_numbers
+from rag_kaggle.knowledge import build_document_profile, format_profile
 from rag_kaggle.hardware import configure_ingestion_devices, configure_kaggle_devices, configure_retrieval_devices
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
 from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.pipeline import IngestionPipeline, PipelineModeError, RetrievalAnswerPipeline
 from rag_kaggle.parsers import DocumentParser, classify_excel_region, rows_to_markdown
 from rag_kaggle.relationships import build_relationships
-from rag_kaggle.storage import MetadataStore, qdrant_point_id, tokenize_vi
+from rag_kaggle.retrieval import HybridRetriever, build_citation, select_relevant_rows, strip_prefix
+from rag_kaggle.storage import MetadataStore, _matches_filters, qdrant_point_id, tokenize_vi
 from rag_kaggle.ui import UploadIngestionGate
 from rag_kaggle.utils import html_table_to_rows, parse_cell_range, parse_number
 from rag_kaggle.vision import classify_image, parse_json_object, render_vlm_output
@@ -97,7 +100,7 @@ class CorePipelineTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_parent_child_chunking(self):
+    def test_structure_aware_chunking(self):
         config = PipelineConfig()
         document = ParsedDocument("doc1", "sample.xlsx", "xlsx", "hash")
         rows = [["Loại thẻ", "Phí"], ["Visa Gold", "499000"]]
@@ -116,7 +119,7 @@ class CorePipelineTests(unittest.TestCase):
             ),
         ]
 
-        parents, chunks = ParentChildChunker(config.chunking).chunk(document)
+        parents, chunks = StructureAwareChunker(config.chunking).chunk(document)
 
         self.assertEqual(2, len(parents))
         self.assertEqual(2, len(chunks))
@@ -129,7 +132,7 @@ class CorePipelineTests(unittest.TestCase):
         store = MetadataStore(Path(":memory:"))
         document = ParsedDocument("doc1", "sample.pdf", "pdf", "hash")
         document.blocks = [Block("b1", "doc1", "text", "Nội dung", "sample.pdf", page=1)]
-        parents, chunks = ParentChildChunker(PipelineConfig().chunking).chunk(document)
+        parents, chunks = StructureAwareChunker(PipelineConfig().chunking).chunk(document)
 
         store.upsert_document(document, parents, chunks)
 
@@ -197,6 +200,23 @@ class UtilityTests(unittest.TestCase):
         self.assertTrue(any("- Khách hàng đủ 18 tuổi\n- Có thu nhập ổn định" in piece for piece in pieces))
         self.assertTrue(all(piece.rstrip().endswith(".") or piece.endswith("định") for piece in pieces))
 
+    def test_split_text_joins_hard_wrapped_lines_but_keeps_short_list_lines(self):
+        import textwrap
+
+        sentences = [f"Khách hàng nhóm {i} phải cung cấp giấy tờ tùy thân hợp lệ và chứng minh thu nhập." for i in range(30)]
+        wrapped = textwrap.fill(" ".join(sentences), width=80)  # PDF-style hard wrapping mid-sentence
+        pieces = split_text(wrapped, 600, 0)
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(piece.rstrip().endswith(".") for piece in pieces), [piece[-30:] for piece in pieces])
+        self.assertTrue(all(len(piece) <= 600 for piece in pieces))
+
+        names = "\n".join(f"Nguyễn Văn Số {i}" for i in range(60))
+        listed = split_text(names, 300, 0)
+        self.assertGreater(len(listed), 1)
+        entries = [line for piece in listed for line in piece.split("\n") if line]
+        self.assertEqual(60, len(entries))  # no name was cut or merged
+        self.assertTrue(all(line.startswith("Nguyễn Văn Số") for line in entries))
+
     def test_config_from_dict(self):
         config = PipelineConfig.from_dict({"work_dir": "/tmp/x", "retrieval": {"rerank_top_k": 3}})
         self.assertEqual(Path("/tmp/x"), config.work_dir)
@@ -255,17 +275,31 @@ class UtilityTests(unittest.TestCase):
 
 
 class ChunkingTests(unittest.TestCase):
-    def test_small_text_blocks_are_merged(self):
+    def test_short_fragments_merge_but_paragraphs_stay_whole(self):
         document = ParsedDocument("doc1", "sample.pdf", "pdf", "hash")
+        paragraph = "Khách hàng phải cung cấp đầy đủ giấy tờ tùy thân khi mở thẻ. " * 4  # > min_text_chars
         document.blocks = [
-            make_block(f"b{i}", "text", f"Đoạn văn số {i} về quy trình.", i, section_path=["A"], page=1)
-            for i in range(5)
+            make_block("a", "text", "Điều 1.", 0, section_path=["A"], page=1),
+            make_block("b", "text", "Phạm vi áp dụng", 1, section_path=["A"], page=1),
+            make_block("c", "text", paragraph.strip(), 2, section_path=["A"], page=1),
+            make_block("d", "text", paragraph.strip(), 3, section_path=["A"], page=2),
         ]
-        _, chunks = ParentChildChunker(ChunkingConfig()).chunk(document)
-        self.assertEqual(1, len(chunks))
-        self.assertEqual([f"b{i}" for i in range(5)], chunks[0].block_ids)
+        _, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
+        # Two tiny fragments are joined with the following paragraph; the last paragraph is its own chunk.
+        self.assertEqual([["a", "b", "c"], ["d"]], [chunk.block_ids for chunk in chunks])
+        self.assertEqual((2, 2), (chunks[1].page_start, chunks[1].page_end))
 
-    def test_wide_table_repeats_key_column_and_excel_range(self):
+    def test_long_paragraph_splits_only_on_sentence_boundaries(self):
+        sentences = [f"Câu số {index} mô tả quy định chi tiết của sản phẩm." for index in range(80)]
+        document = ParsedDocument("doc1", "sample.pdf", "pdf", "hash")
+        document.blocks = [make_block("a", "text", " ".join(sentences), 0, section_path=["A"])]
+        _, chunks = StructureAwareChunker(ChunkingConfig(max_text_chars=600)).chunk(document)
+        self.assertGreater(len(chunks), 1)
+        bodies = [chunk.content.split("\n\n", 1)[1] for chunk in chunks]
+        self.assertTrue(all(len(body) <= 600 for body in bodies))
+        self.assertTrue(all(body.endswith("sản phẩm.") for body in bodies))
+
+    def test_small_table_is_one_markdown_chunk_even_when_wide(self):
         header = ["Chi nhánh"] + [f"T{i}" for i in range(1, 13)]
         rows = [header] + [[f"CN{r}"] + [str(r * c) for c in range(1, 13)] for r in range(1, 21)]
         block = make_block(
@@ -273,12 +307,61 @@ class ChunkingTests(unittest.TestCase):
             metadata={"rows": rows, "origin": [4, 1]},
         )
         document = ParsedDocument("doc1", "bao_cao.xlsx", "xlsx", "hash", blocks=[block])
-        config = ChunkingConfig(table_rows_per_chunk=10, table_max_columns_per_chunk=7, table_key_columns=1)
-        _, chunks = ParentChildChunker(config).chunk(document)
-        self.assertEqual(4, len(chunks))  # 2 row groups x 2 column groups
-        self.assertTrue(all("Chi nhánh" in chunk.content for chunk in chunks))
-        self.assertEqual("A5:G14", chunks[0].cell_range)
-        self.assertEqual("A15:M24", chunks[3].cell_range)
+        _, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
+        self.assertEqual(1, len(chunks))
+        chunk = chunks[0]
+        self.assertEqual("inline", chunk.metadata["table_mode"])
+        self.assertIn(rows_to_markdown(rows), chunk.content)  # never cut by rows or columns
+        self.assertEqual("A4:M24", chunk.cell_range)
+
+    def test_large_table_becomes_preview_chunk_pointing_to_excel(self):
+        rows = [["Mã", "Tên", "Khu vực", "Doanh thu", "Ghi chú", "Cột 6", "Cột 7"]] + [
+            [f"SP{index:04d}", f"Sản phẩm {index}", "Bắc", str(index * 10), "", "x", "y"] for index in range(200)
+        ]
+        block = make_block(
+            "t1", "table", rows_to_markdown(rows), 0, section_path=["Bảng giá"], page=3,
+            metadata={"rows": rows, "xlsx_path": "tables/doc1/t1.xlsx", "caption": "Bảng 1: Giá sản phẩm"},
+        )
+        document = ParsedDocument("doc1", "gia.pdf", "pdf", "hash", blocks=[block])
+        sections, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
+        self.assertEqual(1, len(chunks))
+        chunk = chunks[0]
+        self.assertEqual("preview", chunk.metadata["table_mode"])
+        self.assertEqual(200, chunk.metadata["n_rows"])
+        self.assertEqual("tables/doc1/t1.xlsx", chunk.metadata["xlsx_path"])
+        self.assertIn("tables/doc1/t1.xlsx", chunk.content)
+        self.assertIn("Tên các cột: Mã | Tên | Khu vực | Doanh thu | Ghi chú | Cột 6 | Cột 7", chunk.content)
+        self.assertIn("SP0004", chunk.content)  # 5th row shown
+        self.assertNotIn("SP0199; SP", chunk.content)  # key values are cut between items, never inside one
+        self.assertTrue(chunk.content.split("Giá trị cột đầu tiên")[1].rstrip().endswith("..."))
+        self.assertNotIn("SP0005", chunk.content.split("Giá trị cột đầu tiên")[0])  # preview stops at 5 rows
+        self.assertNotIn("Cột 6", chunk.content.split("Tên các cột")[1].split("\n", 2)[2])  # only 5 columns previewed
+        self.assertLess(len(sections[0].content), len(rows_to_markdown(rows)) // 2)  # section holds the preview only
+
+    def test_image_is_one_chunk_with_caption_and_references(self):
+        block = make_block(
+            "i1", "image", "Bắt đầu → Thẩm định → Phê duyệt", 0, section_path=["Quy trình"], page=2,
+            metadata={"caption": "Hình 1: Quy trình", "image_type": "flowchart", "references": ["Xem Hình 1."]},
+        )
+        document = ParsedDocument("doc1", "qt.pdf", "pdf", "hash", blocks=[block])
+        _, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
+        self.assertEqual(["flowchart"], [chunk.chunk_type for chunk in chunks])
+        self.assertIn("Hình 1: Quy trình", chunks[0].content)
+        self.assertIn("Xem Hình 1.", chunks[0].content)
+
+    def test_chunks_carry_profile_entities_and_keywords(self):
+        document = ParsedDocument("doc1", "qd.pdf", "pdf", "hash")
+        document.blocks = [
+            make_block("a", "text", "Ông Nguyễn Văn A, Chủ tịch UBND quận Ba Đình ký quyết định số 12/QĐ-UBND.", 0, section_path=["QĐ"]),
+            make_block("b", "table", "| x |", 1, section_path=["Khác"], metadata={"rows": [["x"], ["y"]]}),
+        ]
+        profile = {"entities": {"person": ["Nguyễn Văn A"], "place": ["Ba Đình"]}, "keywords": [], "doc_numbers": ["12/QĐ-UBND"]}
+        _, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document, profile)
+        self.assertEqual(["Nguyễn Văn A", "Ba Đình"], chunks[0].entities)
+        self.assertEqual(["12/QĐ-UBND"], chunks[0].keywords)
+        self.assertIn("Entities: Nguyễn Văn A; Ba Đình", chunks[0].content)
+        self.assertEqual([], chunks[1].entities)
+        self.assertEqual(["Nguyễn Văn A", "Ba Đình"], chunks[0].payload()["entities"])
 
 
 class RelationshipTests(unittest.TestCase):
@@ -300,11 +383,122 @@ class RelationshipTests(unittest.TestCase):
         self.assertIn(("t2", "t1", "continues"), kinds)
         self.assertIn(("p", "h", "belongs_to_section"), kinds)
         self.assertEqual(rows[0], document.blocks[4].metadata["inherited_header"])
-        _, chunks = ParentChildChunker(ChunkingConfig()).chunk(document)
+        _, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document)
         table_chunk = next(chunk for chunk in chunks if chunk.block_ids == ["t1"])
         self.assertIn("Table title: Bảng 2: Phí thường niên", table_chunk.content)
         continued = next(chunk for chunk in chunks if chunk.block_ids == ["t2"])
         self.assertIn("| Loại thẻ | Phí |", continued.content)
+
+
+class StructureRetrievalTests(unittest.TestCase):
+    def _store_with_long_section(self):
+        rows = [["Mã", "Tên", "Doanh thu"]] + [[f"SP{i:03d}", f"Sản phẩm {i}", str(i * 10)] for i in range(120)]
+        paragraph = "Quy định về hạn mức tín dụng áp dụng cho khách hàng cá nhân và doanh nghiệp. " * 12
+        document = ParsedDocument("doc1", "gia.pdf", "pdf", "hash")
+        document.blocks = [
+            make_block("p0", "text", "Đoạn mở đầu " + paragraph, 0, section_path=["Giá"], page=1),
+            make_block("p1", "text", "Đoạn giữa " + paragraph, 1, section_path=["Giá"], page=1),
+            make_block("t1", "table", rows_to_markdown(rows), 2, section_path=["Giá"], page=2, metadata={"rows": rows}),
+            make_block("p2", "text", "Đoạn kết " + paragraph, 3, section_path=["Giá"], page=2),
+            make_block("p3", "text", "Đoạn cuối " + paragraph, 4, section_path=["Giá"], page=3),
+        ]
+        sections, chunks = StructureAwareChunker(ChunkingConfig(section_max_chars=100000)).chunk(document)
+        store = MetadataStore(Path(":memory:"))
+        store.upsert_document(document, sections, chunks)
+        config = PipelineConfig()
+        config.retrieval.max_parent_chars_in_context = 3000  # The section is larger than this.
+        return store, HybridRetriever(config, store, None, None), chunks
+
+    def test_large_section_expands_to_neighbours_not_the_whole_section(self):
+        store, retriever, chunks = self._store_with_long_section()
+        try:
+            self.assertEqual(1, len({chunk.parent_id for chunk in chunks}))
+            middle = next(chunk for chunk in chunks if "Đoạn kết" in chunk.content)
+            context = retriever.expand_context([SearchHit(middle, rrf_score=1.0)], query="đoạn kết")[0]
+            self.assertIn("Đoạn kết", context["content"])
+            self.assertIn("[ĐOẠN LIỀN TRƯỚC]", context["content"])
+            self.assertIn("[ĐOẠN LIỀN SAU]", context["content"])
+            self.assertNotIn("Đoạn mở đầu", context["content"])
+            self.assertNotIn("Đoạn cuối", context["content"].split("[ĐOẠN LIỀN SAU]")[0])
+        finally:
+            store.close()
+
+    def test_large_table_hit_returns_the_rows_matching_the_question(self):
+        store, retriever, chunks = self._store_with_long_section()
+        try:
+            table = next(chunk for chunk in chunks if chunk.chunk_type == "table")
+            self.assertEqual("preview", table.metadata["table_mode"])
+            context = retriever.expand_context([SearchHit(table, rrf_score=1.0)], query="Doanh thu của Sản phẩm 77 là bao nhiêu?")[0]
+            self.assertIn("TABLE ROWS", context["content"])
+            self.assertIn("SP077", context["content"].split("TABLE ROWS")[1])
+            self.assertEqual("[gia.pdf, trang 2]", build_citation(SearchHit(table)))
+        finally:
+            store.close()
+
+    def test_select_relevant_rows_prefers_rare_terms_and_keeps_order(self):
+        rows = [["Chi nhánh Hà Nội", "100"], ["Chi nhánh Huế", "200"], ["Chi nhánh Đà Nẵng", "300"]]
+        self.assertEqual([rows[1]], select_relevant_rows(rows, "doanh thu chi nhánh Huế", 1))
+        self.assertEqual([rows[0], rows[2]], select_relevant_rows(rows, "Hà Nội hoặc Đà Nẵng", 5))
+        self.assertEqual([], select_relevant_rows(rows, "không liên quan", 5))
+        self.assertEqual("Nội dung", strip_prefix("Document: a.pdf\nContent type: text\n\nNội dung"))
+        self.assertEqual("Không có tiền tố", strip_prefix("Không có tiền tố"))
+
+    def test_entity_filter_matches_any_overlap_and_store_lists_entities(self):
+        self.assertTrue(_matches_filters({"entities": ["Hà Nội", "Nguyễn Văn A"]}, {"entities": "Hà Nội"}))
+        self.assertTrue(_matches_filters({"entities": ["Huế"]}, {"entities": ["Hà Nội", "Huế"]}))
+        self.assertFalse(_matches_filters({"entities": ["Huế"]}, {"entities": ["Hà Nội"]}))
+        self.assertFalse(_matches_filters({"entities": []}, {"entities": ["Hà Nội"]}))
+        store = MetadataStore(Path(":memory:"))
+        try:
+            document = ParsedDocument("doc1", "qd.pdf", "pdf", "hash")
+            document.metadata["profile"] = {"title": "QĐ", "entities": {"person": ["Nguyễn Văn A"]}}
+            document.blocks = [make_block("a", "text", "Ông Nguyễn Văn A ký.", 0, section_path=["QĐ"])]
+            profile = {"entities": {"person": ["Nguyễn Văn A"]}}
+            sections, chunks = StructureAwareChunker(ChunkingConfig()).chunk(document, profile)
+            store.upsert_document(document, sections, chunks)
+            self.assertEqual(["Nguyễn Văn A"], store.list_values("entity"))
+            self.assertEqual("QĐ", store.get_document_profile("doc1")["title"])
+            self.assertEqual([chunks[0].chunk_id], [c.chunk_id for c in store.chunks_in_parent(sections[0].parent_id)])
+            self.assertEqual(chunks[0], store.get_chunk(chunks[0].chunk_id))
+        finally:
+            store.close()
+
+    def test_old_chunk_json_without_new_fields_still_loads(self):
+        old = {
+            "chunk_id": "c", "parent_id": "p", "document_id": "d", "source_file": "a.pdf", "chunk_type": "text",
+            "content": "x", "block_ids": ["b"],
+        }
+        chunk = ChildChunk(**old)
+        self.assertEqual(([], []), (chunk.keywords, chunk.entities))
+
+
+@unittest.skipUnless(has("openpyxl"), "openpyxl missing")
+class TableExcelTests(unittest.TestCase):
+    def test_large_table_is_written_in_full_and_small_one_is_not(self):
+        import openpyxl
+
+        from rag_kaggle.parsers import save_table_excel
+
+        big = [["Mã", "Giá"]] + [[f"00{i}", str(i)] for i in range(100)]
+        small = [["A", "B"], ["1", "2"]]
+        document = ParsedDocument("doc1", "gia.pdf", "pdf", "hash")
+        document.blocks = [
+            make_block("big", "table", rows_to_markdown(big), 0, page=4, metadata={"rows": big, "caption": "Bảng giá"}),
+            make_block("small", "table", rows_to_markdown(small), 1, metadata={"rows": small}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            table_dir = Path(tmp) / "tables"
+            self.assertEqual(1, save_table_excel(document, table_dir, ChunkingConfig()))
+            self.assertNotIn("xlsx_path", document.blocks[1].metadata)
+            relative = document.blocks[0].metadata["xlsx_path"]
+            self.assertEqual("tables/doc1/big.xlsx", relative)
+            workbook = openpyxl.load_workbook(Path(tmp) / relative)
+            sheet = workbook["Table"]
+            self.assertEqual(101, sheet.max_row)
+            self.assertEqual("001", sheet["A3"].value)  # identifiers stay text, leading zeros kept
+            info = {row[0].value: row[1].value for row in workbook["Info"].iter_rows()}
+            self.assertEqual("Bảng giá", info["caption"])
+            self.assertEqual("100", info["data_rows"])
 
 
 class ComputationAndGuardrailTests(unittest.TestCase):
@@ -622,6 +816,72 @@ class EndToEndTests(unittest.TestCase):
         )
         evaluation = self.pipeline.evaluate(dataset, run_answers=False)
         self.assertEqual(1.0, evaluation["retrieval"]["recall@5"])
+
+    def test_large_table_preview_excel_and_row_level_answer_context(self):
+        import openpyxl
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "Giá"
+        sheet.append(["Mã", "Sản phẩm", "Đơn giá"])
+        for index in range(150):
+            sheet.append([f"SP{index:03d}", f"Mặt hàng {index}", index * 1000])
+        path = self.inputs / "bang_gia.xlsx"
+        workbook.save(path)
+
+        # Other documents make the corpus big enough for BM25 to produce positive scores.
+        report = self.pipeline.ingest([path, self._docx(), self._pdf()])
+        self.assertTrue(report["ok"], report["errors"])
+
+        chunks = self.pipeline.metadata.list_chunks()
+        tables = [chunk for chunk in chunks if chunk.chunk_type == "table" and chunk.source_file == "bang_gia.xlsx"]
+        self.assertEqual(1, len(tables))  # the table is not cut into pieces
+        self.assertEqual("preview", tables[0].metadata["table_mode"])
+        self.assertEqual(150, tables[0].metadata["n_rows"])
+        xlsx = self.pipeline.config.work_dir / tables[0].metadata["xlsx_path"]
+        self.assertTrue(xlsx.exists())
+        self.assertEqual(151, openpyxl.load_workbook(xlsx)["Table"].max_row)
+        stored = json.loads(
+            self.pipeline.metadata.connection.execute("SELECT payload_json FROM blocks WHERE block_type = 'table'").fetchone()[0]
+        )
+        self.assertEqual(151, len(stored["metadata"]["rows"]))  # full table still in the database
+
+        # SP123 is far beyond the preview and the clipped key-value list, yet BM25 must still find the table.
+        self.assertNotIn("SP123", tables[0].content)
+        self.assertIn(tables[0].chunk_id, self.pipeline.index.sparse_search("SP123", 5))
+
+        result = self.pipeline.ask("Đơn giá của Mặt hàng 123 là bao nhiêu?")
+        self.assertFalse(result["refused"])
+        self.assertIn("TABLE ROWS", self.prompts[-1])
+        self.assertIn("SP123", self.prompts[-1])
+
+    def test_profile_entities_reach_chunks_payload_and_answer_prompt(self):
+        from docx import Document
+
+        document = Document()
+        document.add_heading("Quyết định bổ nhiệm", level=1)
+        document.add_paragraph("Số: 45/2025/QĐ-UBND")
+        document.add_paragraph("Người ký: Trần Thị Bình")
+        document.add_paragraph("Bà Trần Thị Bình ký quyết định bổ nhiệm giám đốc chi nhánh Huế.")
+        path = self.inputs / "qd.docx"
+        document.save(path)
+        self.assertTrue(self.pipeline.ingest([path])["ok"])
+
+        stored = json.loads(self.pipeline.metadata.connection.execute("SELECT payload_json FROM documents").fetchone()[0])
+        profile = stored["metadata"]["profile"]
+        self.assertEqual(["45/2025/QĐ-UBND"], profile["doc_numbers"])
+        self.assertEqual(["Trần Thị Bình"], profile["entities"]["signer"])
+        tagged = [chunk for chunk in self.pipeline.metadata.list_chunks() if "Trần Thị Bình" in chunk.entities]
+        self.assertTrue(tagged)
+        self.assertEqual("Trần Thị Bình", tagged[0].payload()["entities"][0])
+
+        self.pipeline.ask("Trần Thị Bình ký quyết định nào?")
+        self.assertIn("document_info:", self.prompts[-1])
+        self.assertIn("người ký: Trần Thị Bình", self.prompts[-1])
+        hits = self.pipeline.retriever.retrieve("quyết định của Trần Thị Bình")
+        self.assertTrue(any("Trần Thị Bình" in hit.chunk.entities for hit in hits))
+        self.assertTrue(self.pipeline.index.entity_search("Trần Thị Bình là ai", 10))
+        self.assertEqual([], self.pipeline.index.entity_search("câu hỏi không nhắc ai", 10))
 
     def test_new_version_is_retained_and_bad_file_is_reported(self):
         path = self._docx()

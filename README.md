@@ -5,7 +5,7 @@ Pipeline được tách thành hai session độc lập:
 ```text
 01_ingestion.ipynb
 PDF / DOCX / Excel / ZIP / folder
--> parse + OCR/VLM -> parent-child chunking -> embedding
+-> parse + OCR (+ LLM hiệu đính) -> structure-aware chunking -> embedding
 -> Qdrant + BM25 + metadata/assets
 -> frozen corpus_bundle.zip
 
@@ -25,6 +25,7 @@ from pathlib import Path
 
 OCR_MODEL = "PaddleOCR-VL-1.6"
 VISION_MODEL = None
+CORRECTION_MODEL = "Qwen/Qwen2.5-7B-Instruct"  # None để tắt bước sửa lỗi chính tả OCR
 EMBEDDING_MODEL = "BAAI/bge-m3"
 EMBEDDING_REVISION = None
 
@@ -35,6 +36,10 @@ INPUT_SOURCES = [Path("/kaggle/input") / slug for slug in INPUT_DATASET_SLUGS]
 Input có thể là folder Kaggle Dataset, ZIP hoặc file đơn. Các định dạng được nhận gồm `.pdf`, `.docx`,
 `.xlsx`, `.xls`, `.xlsm`, `.xltx`, `.xltm`. Dùng folder Kaggle Dataset nhanh hơn ZIP. File `.xls` cần
 LibreOffice để chuyển đổi.
+
+Với trang scan, text OCR được một LLM thứ hai sửa lỗi chính tả (mục 5). Chunk bám theo cấu trúc: mỗi
+đoạn, ảnh hoặc bảng là một chunk; bảng lớn được lưu đầy đủ trong `tables/<document_id>/*.xlsx` và chunk chỉ giữ
+phần xem trước (mục 3).
 
 Notebook tạo `/kaggle/working/corpus_bundle.zip`; tải file này về máy hoặc lưu thành Kaggle Dataset.
 Nếu muốn upload trực tiếp từ máy thay vì dùng Kaggle Dataset, có thể mở
@@ -72,7 +77,7 @@ corpus_bundle.zip
 ├── qdrant/
 ├── metadata.db
 ├── bm25.pkl
-├── tables/
+├── tables/            # parquet + xlsx đầy đủ của các bảng lớn
 ├── assets/
 └── parsed/
 ```
@@ -127,10 +132,16 @@ print(result["answer"], result["citations"])
 T4 x2 trong Ingestion:
 
 ```text
-GPU 0: dense embedding -> optional VLM
+GPU 0: LLM hiệu đính OCR (lúc parse) -> optional VLM -> dense embedding (sau khi parse xong)
 GPU 1: PaddleOCR-VL worker
 CPU: parser, chunker, Qdrant, BM25, metadata
 ```
+
+LLM hiệu đính được giải phóng trước khi embedding bắt đầu nên không tranh VRAM với BGE. Mỗi lần gọi LLM là độc lập:
+`system + glossary tài liệu + đoạn liền trước đã sửa (tối đa 1 trang trước) + đoạn cần sửa`, nên context không phình ra
+theo độ dài tài liệu. Bản sửa nào làm đổi số, đổi độ dài quá `max_length_change` hoặc khác bản gốc quá nhiều sẽ bị loại và
+giữ nguyên bản OCR (`metadata.ocr_original_text` luôn giữ bản gốc khi có sửa). Một máy chỉ có 1 GPU dùng chung
+GPU cho OCR và LLM; máy không có GPU tự tắt bước này.
 
 T4 x2 trong Retrieve & Answer:
 
@@ -150,4 +161,5 @@ pip install pymupdf python-docx openpyxl pandas pyarrow pillow rank-bm25 qdrant-
 python -m unittest discover -s tests
 ```
 
-Thiết kế chi tiết nằm trong [Architecture.md](Architecture.md).
+Thiết kế chi tiết nằm trong [Architecture.md](Architecture.md). Kết quả kiểm tra luồng xử lý từng bước
+(trích xuất -> chunk -> embedding -> Qdrant -> retrieve) nằm trong [docs/data-flow-audit.md](docs/data-flow-audit.md).

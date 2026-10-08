@@ -6,12 +6,14 @@ import logging
 import re
 import time
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable, Iterable
 from xml.etree import ElementTree
 
-from .config import PARSER_VERSION, PipelineConfig
+from .chunking import is_large_table, table_header_and_body
+from .config import ChunkingConfig, PARSER_VERSION, PipelineConfig
+from .correction import OCRCorrector
 from .ingestion import IngestionError, convert_with_libreoffice, find_libreoffice
 from .models import Block, ParsedDocument
 from .paddleocr_vl import PaddleOCRVLAdapter
@@ -39,6 +41,7 @@ __all__ = [
     "file_sha256",
     "rows_to_markdown",
     "save_parsed_document",
+    "save_table_excel",
     "stable_id",
 ]
 
@@ -50,6 +53,8 @@ OCR_HEADING_LABELS = {"doc_title", "paragraph_title", "title", "header_title", "
 OCR_TABLE_LABELS = {"table"}
 OCR_IMAGE_LABELS = {"image", "figure", "chart", "seal"}
 OCR_SKIP_LABELS = {"header", "footer", "number", "page_number", "footnote_number"}
+# Structured or symbolic content must never be "spell-corrected" by a language model.
+OCR_NO_CORRECTION_LABELS = OCR_TABLE_LABELS | OCR_IMAGE_LABELS | {"formula", "formula_number", "algorithm", "code", "code_block"}
 
 DRAWING_NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -67,10 +72,12 @@ class DocumentParser:
         config: PipelineConfig,
         ocr: PaddleOCRVLAdapter | None = None,
         vision: VisionReasoner | None = None,
+        corrector: OCRCorrector | None = None,
     ):
         self.config = config
         self.ocr = ocr
         self.vision = vision
+        self.corrector = corrector
         self._progress: Callable[[str], None] | None = None
 
     def parse(
@@ -82,6 +89,8 @@ class DocumentParser:
         source = Path(path)
         extension = source.suffix.lower()
         previous_progress, self._progress = self._progress, progress
+        if self.corrector is not None:
+            self.corrector.begin_document(display_name or source.name)
         try:
             if extension == ".pdf":
                 document = self._parse_pdf(source)
@@ -95,6 +104,8 @@ class DocumentParser:
                 raise IngestionError("unsupported_type", f"Unsupported file type: {extension}")
         finally:
             self._progress = previous_progress
+        if self.corrector is not None and self.corrector.config.enabled:
+            document.metadata["ocr_correction"] = self.corrector.finish_document()
         if display_name:
             document.source_file = display_name
             for block in document.blocks:
@@ -254,6 +265,21 @@ class DocumentParser:
         elif vlm_result["status"] == "needs_review":
             image_block.metadata["vlm_status"] = "needs_review"
         return image_block
+
+    def _correction_scope(self, document: ParsedDocument, page_number: int):
+        if self.corrector is None or not self.corrector.enabled:
+            return nullcontext()
+        return self._timed_unit(document, "ocr_correction", f"PDF page {page_number}", page=page_number)
+
+    def _correct_ocr_text(self, text: str, page: int, metadata: dict) -> str:
+        """LLM spelling fix for one OCR paragraph; the original text is kept in the block metadata."""
+        if self.corrector is None or not self.corrector.enabled:
+            return text
+        result = self.corrector.correct(text, page=page)
+        metadata["ocr_correction"] = result.status
+        if result.changed:
+            metadata["ocr_original_text"] = result.original
+        return result.text
 
     def _run_ocr(self, document: ParsedDocument, image_path: Path, unit: str | None = None) -> dict:
         if not self.config.parsing.enable_ocr or self.ocr is None:
@@ -453,14 +479,17 @@ class DocumentParser:
 
         if not layout_blocks:
             if ocr_result["text"]:
+                page_metadata = {"ocr": ocr_result["raw"], "is_scan": True}
+                with self._correction_scope(document, page_number):
+                    page_text = self._correct_ocr_text(ocr_result["text"], page_number, page_metadata)
                 document.add_block(
                     self._block(
                         document,
                         "ocr_page",
-                        ocr_result["text"],
+                        page_text,
                         f"page-{page_number}",
                         section_path=list(sections),
-                        metadata={"ocr": ocr_result["raw"], "is_scan": True},
+                        metadata=page_metadata,
                         raw_content=ocr_result["raw"],
                         **common,
                     )
@@ -471,6 +500,10 @@ class DocumentParser:
 
         # Raw OCR output is kept once per page for audit/re-parsing.
         document.metadata.setdefault("ocr_raw_pages", {})[str(page_number)] = ocr_result["raw"]
+        with self._correction_scope(document, page_number):
+            return self._add_scanned_blocks(document, layout_blocks, page_number, sections, common)
+
+    def _add_scanned_blocks(self, document, layout_blocks, page_number, sections, common):
         for index, item in enumerate(layout_blocks):
             label, content = item["label"], item["content"]
             if label in OCR_SKIP_LABELS:
@@ -482,6 +515,8 @@ class DocumentParser:
                 if rows:
                     self._add_table(document, rows, ordinal, section_path=list(sections), **common, **extra)
                     continue
+            if label not in OCR_NO_CORRECTION_LABELS:
+                content = self._correct_ocr_text(content, page_number, extra["metadata"])
             if label in OCR_HEADING_LABELS:
                 text = clean_text(re.sub(r"^#+\s*", "", content))
                 level = 1 if label == "doc_title" or not sections else 2
@@ -1258,6 +1293,49 @@ def save_table_parquet(document: ParsedDocument, table_dir: Path) -> int:
             LOGGER.warning("Could not write parquet for %s: %s", block.block_id, exc)
             return written
         block.metadata["table_path"] = path.relative_to(table_dir.parent).as_posix()
+        written += 1
+    return written
+
+
+_ILLEGAL_XLSX_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def save_table_excel(document: ParsedDocument, table_dir: Path, chunking: ChunkingConfig) -> int:
+    """Write every table too large to inline (see ``is_large_table``) to its own .xlsx.
+
+    The chunk keeps a preview; the complete table is here and in the block rows. Cells
+    stay text exactly as extracted, so identifiers such as ``00123`` are not turned into numbers.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return 0
+    written = 0
+    target_dir = table_dir / document.document_id
+    for block in document.blocks:
+        if block.block_type != "table" or not block.metadata.get("rows") or not is_large_table(block, chunking):
+            continue
+        header, body = table_header_and_body(block)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Table"
+        for row in ([header] if header else []) + body:
+            sheet.append([_ILLEGAL_XLSX_CHARS.sub("", str(cell))[:32000] for cell in row])
+        info = workbook.create_sheet("Info")
+        for key, value in (
+            ("source_file", document.source_file),
+            ("page", block.page),
+            ("sheet", block.sheet_name),
+            ("cell_range", block.cell_range),
+            ("caption", block.metadata.get("caption")),
+            ("block_id", block.block_id),
+            ("data_rows", len(body)),
+        ):
+            info.append([key, "" if value is None else _ILLEGAL_XLSX_CHARS.sub("", str(value))])
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{block.block_id}.xlsx"
+        workbook.save(path)
+        block.metadata["xlsx_path"] = path.relative_to(table_dir.parent).as_posix()
         written += 1
     return written
 
