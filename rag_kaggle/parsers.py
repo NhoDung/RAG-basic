@@ -4,7 +4,9 @@ import datetime as dt
 import json
 import logging
 import re
+import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable
 from xml.etree import ElementTree
@@ -103,6 +105,35 @@ class DocumentParser:
         if self._progress is not None:
             self._progress(message)
 
+    @contextmanager
+    def _timed_unit(self, document: ParsedDocument, operation: str, unit: str, **details):
+        started_at = dt.datetime.now(dt.timezone.utc)
+        started_perf = time.perf_counter()
+        status = "success"
+        self._notify(f"[TIMING START] {operation} | {unit} | {started_at.isoformat(timespec='seconds')}")
+        try:
+            yield
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            finished_at = dt.datetime.now(dt.timezone.utc)
+            elapsed_seconds = round(time.perf_counter() - started_perf, 3)
+            timing = {
+                "operation": operation,
+                "unit": unit,
+                "started_at": started_at.isoformat(timespec="seconds"),
+                "finished_at": finished_at.isoformat(timespec="seconds"),
+                "elapsed_seconds": elapsed_seconds,
+                "status": status,
+                **details,
+            }
+            document.metadata.setdefault("timings", []).append(timing)
+            self._notify(
+                f"[TIMING END] {operation} | {unit} | {finished_at.isoformat(timespec='seconds')} "
+                f"| elapsed_seconds={elapsed_seconds:.3f} | status={status}"
+            )
+
     # ------------------------------------------------------------------ common
 
     def _new_document(self, source: Path) -> ParsedDocument:
@@ -164,7 +195,14 @@ class DocumentParser:
         """OCR an image, classify it and optionally enrich it with a VLM block."""
         if not self._image_is_large_enough(image_path):
             return None  # Logos/icons are treated as decorative and not indexed.
-        ocr_result = self._run_ocr(document, image_path)
+        location = (
+            f"PDF page {kwargs['page']} image {image_path.name}"
+            if kwargs.get("page") is not None
+            else f"Excel sheet {kwargs['sheet_name']} image {image_path.name}"
+            if kwargs.get("sheet_name")
+            else f"image {image_path.name}"
+        )
+        ocr_result = self._run_ocr(document, image_path, unit=location)
         labels = [block["label"] for block in ocr_result.get("blocks", [])]
         image_type = classify_image(caption, ocr_result["text"], labels)
         metadata = kwargs.pop("metadata", {})
@@ -172,13 +210,14 @@ class DocumentParser:
 
         vlm_result = {"status": "skipped", "output": None}
         if self.vision is not None and image_type in ("flowchart", "chart"):
-            vlm_result = self.vision.describe(
-                image_path,
-                image_type,
-                ocr_text=ocr_result["text"],
-                caption=caption,
-                section=" > ".join(section_path),
-            )
+            with self._timed_unit(document, "vlm", location, asset=str(image_path), image_type=image_type):
+                vlm_result = self.vision.describe(
+                    image_path,
+                    image_type,
+                    ocr_text=ocr_result["text"],
+                    caption=caption,
+                    section=" > ".join(section_path),
+                )
             if vlm_result["status"] not in ("success", "skipped"):
                 self._warn(document, "vlm", f"VLM {vlm_result['status']} for {image_path.name}")
 
@@ -216,11 +255,12 @@ class DocumentParser:
             image_block.metadata["vlm_status"] = "needs_review"
         return image_block
 
-    def _run_ocr(self, document: ParsedDocument, image_path: Path) -> dict:
+    def _run_ocr(self, document: ParsedDocument, image_path: Path, unit: str | None = None) -> dict:
         if not self.config.parsing.enable_ocr or self.ocr is None:
             return {"text": "", "blocks": [], "raw": [], "model": None}
         try:
-            return self.ocr.predict(image_path)
+            with self._timed_unit(document, "ocr", unit or image_path.name, asset=str(image_path)):
+                return self.ocr.predict(image_path)
         except Exception as exc:
             LOGGER.exception("OCR failed for %s", image_path)
             self._warn(document, "ocr", f"OCR failed for {image_path.name}: {exc}", asset=str(image_path))
@@ -259,21 +299,23 @@ class DocumentParser:
 
         for page_index, page in enumerate(pdf):
             page_number = page_index + 1
-            page_text = clean_text(page.get_text("text"))
-            if len(page_text) < self.config.parsing.scan_text_threshold:
-                if self.config.parsing.enable_ocr:
-                    self._notify(f"PDF page {page_number}/{pdf.page_count}: rendering and PaddleOCR-VL.")
-                    sections = self._parse_scanned_page(document, page, page_number, asset_dir, sections)
-                elif page_text:
-                    self._notify(f"PDF page {page_number}/{pdf.page_count}: short text, OCR disabled.")
-                    document.add_block(
-                        self._block(document, "text", page_text, f"page-{page_number}-raw", page=page_number)
+            unit = f"PDF page {page_number}/{pdf.page_count}"
+            with self._timed_unit(document, "parse", unit, page=page_number):
+                page_text = clean_text(page.get_text("text"))
+                if len(page_text) < self.config.parsing.scan_text_threshold:
+                    if self.config.parsing.enable_ocr:
+                        self._notify(f"{unit}: rendering and PaddleOCR-VL.")
+                        sections = self._parse_scanned_page(document, page, page_number, asset_dir, sections)
+                    elif page_text:
+                        self._notify(f"{unit}: short text, OCR disabled.")
+                        document.add_block(
+                            self._block(document, "text", page_text, f"page-{page_number}-raw", page=page_number)
+                        )
+                else:
+                    self._notify(f"{unit}: extracting text, tables, and images.")
+                    sections = self._parse_digital_page(
+                        document, pdf, page, page_number, asset_dir, sections, body_size, heading_levels
                     )
-                continue
-            self._notify(f"PDF page {page_number}/{pdf.page_count}: extracting text, tables, and images.")
-            sections = self._parse_digital_page(
-                document, pdf, page, page_number, asset_dir, sections, body_size, heading_levels
-            )
 
         pdf.close()
         return document
@@ -402,9 +444,10 @@ class DocumentParser:
 
     def _parse_scanned_page(self, document, page, page_number, asset_dir, sections):
         image_path = asset_dir / f"page_{page_number:04d}.png"
-        pixmap = page.get_pixmap(dpi=self.config.parsing.render_dpi, alpha=False)
-        pixmap.save(image_path)
-        ocr_result = self._run_ocr(document, image_path)
+        with self._timed_unit(document, "render", f"PDF page {page_number}", page=page_number):
+            pixmap = page.get_pixmap(dpi=self.config.parsing.render_dpi, alpha=False)
+            pixmap.save(image_path)
+        ocr_result = self._run_ocr(document, image_path, unit=f"PDF page {page_number}")
         layout_blocks = ocr_result.get("blocks") or []
         common = {"page": page_number, "asset_path": self._artifact_ref(image_path)}
 
@@ -481,38 +524,40 @@ class DocumentParser:
         total_items = len(body_items)
         self._notify(f"DOCX: reading {total_items} body block(s), headers, tables, charts, and images.")
         for ordinal, item in enumerate(body_items, start=1):
-            if ordinal == 1 or ordinal == total_items or ordinal % 10 == 0:
-                self._notify(f"DOCX block {ordinal}/{total_items}.")
-            if isinstance(item, Paragraph):
-                text = clean_text(item.text)
-                style_name = item.style.name if item.style is not None else ""
-                level = _docx_heading_level(item, style_name)
-                if text:
-                    if level:
-                        block_type = "heading"
-                        sections = sections[: level - 1] + [text]
-                    elif style_name.lower().startswith(("caption", "chú thích")) or (
-                        CAPTION_PATTERN.match(text) and len(text) <= 300
-                    ):
-                        block_type = "caption"
-                        last_caption = text
-                    else:
-                        block_type = "text"
-                    document.add_block(
-                        self._block(
-                            document,
-                            block_type,
-                            text,
-                            f"docx-{ordinal}",
-                            section_path=list(sections),
-                            metadata={"style": style_name, "heading_level": level},
+            unit = f"DOCX block {ordinal}/{total_items}"
+            with self._timed_unit(document, "parse", unit, block=ordinal):
+                if ordinal == 1 or ordinal == total_items or ordinal % 10 == 0:
+                    self._notify(f"{unit}.")
+                if isinstance(item, Paragraph):
+                    text = clean_text(item.text)
+                    style_name = item.style.name if item.style is not None else ""
+                    level = _docx_heading_level(item, style_name)
+                    if text:
+                        if level:
+                            block_type = "heading"
+                            sections = sections[: level - 1] + [text]
+                        elif style_name.lower().startswith(("caption", "chú thích")) or (
+                            CAPTION_PATTERN.match(text) and len(text) <= 300
+                        ):
+                            block_type = "caption"
+                            last_caption = text
+                        else:
+                            block_type = "text"
+                        document.add_block(
+                            self._block(
+                                document,
+                                block_type,
+                                text,
+                                f"docx-{ordinal}",
+                                section_path=list(sections),
+                                metadata={"style": style_name, "heading_level": level},
+                            )
                         )
+                    self._extract_paragraph_drawings(
+                        document, docx, item, ordinal, asset_dir, sections, seen_parts, last_caption
                     )
-                self._extract_paragraph_drawings(
-                    document, docx, item, ordinal, asset_dir, sections, seen_parts, last_caption
-                )
-            elif isinstance(item, Table):
-                self._add_docx_table(document, item, f"docx-{ordinal}", sections)
+                elif isinstance(item, Table):
+                    self._add_docx_table(document, item, f"docx-{ordinal}", sections)
 
         self._notify("DOCX: extracting media not anchored in the body flow.")
         self._extract_unreferenced_media(document, source, asset_dir, sections, seen_parts)
@@ -645,94 +690,102 @@ class DocumentParser:
         total_sheets = len(formulas.worksheets)
         self._notify(f"Excel: reading {total_sheets} worksheet(s), cells, merged ranges, and formulas.")
         for sheet_index, formula_sheet in enumerate(formulas.worksheets):
-            self._notify(f"Excel sheet {sheet_index + 1}/{total_sheets}: {formula_sheet.title}.")
-            if formula_sheet.sheet_state != "visible":
-                hidden_sheets.append(formula_sheet.title)
-                if not self.config.parsing.include_hidden_sheets:
-                    continue
-            value_sheet = values[formula_sheet.title]
-            grid, formula_map, hidden = self._read_sheet_grid(formula_sheet, value_sheet)
-            missing_cached += sum(1 for info in formula_map.values() if info["cached_value"] is None)
-            title: str | None = None
+            unit = f"Excel sheet {sheet_index + 1}/{total_sheets}: {formula_sheet.title}"
+            with self._timed_unit(document, "parse", unit, sheet_name=formula_sheet.title):
+                self._notify(f"{unit}.")
+                if formula_sheet.sheet_state != "visible":
+                    hidden_sheets.append(formula_sheet.title)
+                    if not self.config.parsing.include_hidden_sheets:
+                        continue
+                value_sheet = values[formula_sheet.title]
+                grid, formula_map, hidden = self._read_sheet_grid(formula_sheet, value_sheet)
+                missing_cached += sum(1 for info in formula_map.values() if info["cached_value"] is None)
+                title: str | None = None
 
-            for region_index, (min_row, max_row, min_col, max_col) in enumerate(split_excel_regions_from_grid(grid)):
-                rows = [
-                    [grid[r - 1][c - 1] if c - 1 < len(grid[r - 1]) else "" for c in range(min_col, max_col + 1)]
-                    for r in range(min_row, max_row + 1)
-                ]
-                cell_range = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
-                region_formulas = {
-                    coordinate: info
-                    for coordinate, info in formula_map.items()
-                    if min_row <= info["row"] <= max_row and min_col <= info["col"] <= max_col
-                }
-                kind = classify_excel_region(rows)
-                section = [formula_sheet.title] + ([title] if title and kind != "text" else [])
-                common = {
-                    "section_path": section,
-                    "sheet_name": formula_sheet.title,
-                    "cell_range": cell_range,
-                }
-                region_meta = {
-                    "formulas": region_formulas,
-                    "origin": [min_row, min_col],
-                    "numeric_repr": "python",
-                }
-                ordinal = f"sheet-{sheet_index}-region-{region_index}"
-                if kind == "text":
-                    text = "\n".join(dict.fromkeys(cell for row in rows for cell in row if cell))
-                    title = text.split("\n")[0][:160]
-                    block = document.add_block(self._block(document, "text", text, ordinal, metadata=region_meta, **common))
-                elif kind == "kpi":
-                    block = document.add_block(
-                        self._block(
-                            document,
-                            "kpi",
-                            render_kpi(rows),
-                            ordinal,
-                            metadata={**region_meta, "rows": rows},
-                            **common,
+                for region_index, (min_row, max_row, min_col, max_col) in enumerate(split_excel_regions_from_grid(grid)):
+                    rows = [
+                        [grid[r - 1][c - 1] if c - 1 < len(grid[r - 1]) else "" for c in range(min_col, max_col + 1)]
+                        for r in range(min_row, max_row + 1)
+                    ]
+                    cell_range = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+                    region_formulas = {
+                        coordinate: info
+                        for coordinate, info in formula_map.items()
+                        if min_row <= info["row"] <= max_row and min_col <= info["col"] <= max_col
+                    }
+                    kind = classify_excel_region(rows)
+                    section = [formula_sheet.title] + ([title] if title and kind != "text" else [])
+                    common = {
+                        "section_path": section,
+                        "sheet_name": formula_sheet.title,
+                        "cell_range": cell_range,
+                    }
+                    region_meta = {
+                        "formulas": region_formulas,
+                        "origin": [min_row, min_col],
+                        "numeric_repr": "python",
+                    }
+                    ordinal = f"sheet-{sheet_index}-region-{region_index}"
+                    if kind == "text":
+                        text = "\n".join(dict.fromkeys(cell for row in rows for cell in row if cell))
+                        title = text.split("\n")[0][:160]
+                        block = document.add_block(
+                            self._block(document, "text", text, ordinal, metadata=region_meta, **common)
                         )
-                    )
-                else:
-                    block = self._add_table(document, rows, ordinal, metadata=region_meta, **common)
-                if block is not None:
-                    sheet_regions.setdefault(formula_sheet.title, []).append((block, (min_row, max_row, min_col, max_col)))
-            if hidden["rows"] or hidden["columns"]:
-                document.metadata.setdefault("hidden_ranges", {})[formula_sheet.title] = hidden
+                    elif kind == "kpi":
+                        block = document.add_block(
+                            self._block(
+                                document,
+                                "kpi",
+                                render_kpi(rows),
+                                ordinal,
+                                metadata={**region_meta, "rows": rows},
+                                **common,
+                            )
+                        )
+                    else:
+                        block = self._add_table(document, rows, ordinal, metadata=region_meta, **common)
+                    if block is not None:
+                        sheet_regions.setdefault(formula_sheet.title, []).append(
+                            (block, (min_row, max_row, min_col, max_col))
+                        )
+                if hidden["rows"] or hidden["columns"]:
+                    document.metadata.setdefault("hidden_ranges", {})[formula_sheet.title] = hidden
 
         self._notify("Excel: extracting charts and embedded images.")
         for sheet_index, formula_sheet in enumerate(formulas.worksheets):
             if formula_sheet.title in hidden_sheets and not self.config.parsing.include_hidden_sheets:
                 continue
-            for chart_index, chart in enumerate(getattr(formula_sheet, "_charts", [])):
-                info = openpyxl_chart_info(chart, values)
-                document.add_block(
-                    self._block(
-                        document,
-                        "chart",
-                        render_chart(info),
-                        f"sheet-{sheet_index}-chart-{chart_index}",
-                        section_path=[formula_sheet.title],
-                        sheet_name=formula_sheet.title,
-                        metadata=info,
+            unit = f"Excel sheet {sheet_index + 1}/{total_sheets}: {formula_sheet.title}"
+            with self._timed_unit(document, "extract_visuals", unit, sheet_name=formula_sheet.title):
+                for chart_index, chart in enumerate(getattr(formula_sheet, "_charts", [])):
+                    info = openpyxl_chart_info(chart, values)
+                    document.add_block(
+                        self._block(
+                            document,
+                            "chart",
+                            render_chart(info),
+                            f"sheet-{sheet_index}-chart-{chart_index}",
+                            section_path=[formula_sheet.title],
+                            sheet_name=formula_sheet.title,
+                            metadata=info,
+                        )
                     )
-                )
-            for image_index, image in enumerate(getattr(formula_sheet, "_images", [])):
-                try:
-                    image_bytes = image._data()
-                except (AttributeError, ValueError):
-                    continue
-                extension = Path(getattr(image, "path", "image.png")).suffix or ".png"
-                image_path = asset_dir / f"sheet_{sheet_index}_image_{image_index}{extension}"
-                image_path.write_bytes(image_bytes)
-                self._add_visual(
-                    document,
-                    image_path,
-                    f"sheet-{sheet_index}-image-{image_index}",
-                    [formula_sheet.title],
-                    sheet_name=formula_sheet.title,
-                )
+                for image_index, image in enumerate(getattr(formula_sheet, "_images", [])):
+                    try:
+                        image_bytes = image._data()
+                    except (AttributeError, ValueError):
+                        continue
+                    extension = Path(getattr(image, "path", "image.png")).suffix or ".png"
+                    image_path = asset_dir / f"sheet_{sheet_index}_image_{image_index}{extension}"
+                    image_path.write_bytes(image_bytes)
+                    self._add_visual(
+                        document,
+                        image_path,
+                        f"sheet-{sheet_index}-image-{image_index}",
+                        [formula_sheet.title],
+                        sheet_name=formula_sheet.title,
+                    )
 
         document.metadata.update(
             {
@@ -828,28 +881,30 @@ class DocumentParser:
         document.metadata["converted_with"] = "calamine"
         sheets = pd.read_excel(source, sheet_name=None, header=None, engine="calamine")
         for sheet_index, (sheet_name, frame) in enumerate(sheets.items()):
-            frame = frame.dropna(how="all").dropna(axis=1, how="all")
-            if frame.empty:
-                continue
-            rows = [
-                ["" if pd.isna(value) else str(value) for value in row]
-                for row in frame.itertuples(index=False, name=None)
-            ]
-            first_row = int(frame.index[0]) + 1
-            first_col = int(frame.columns[0]) + 1
-            cell_range = (
-                f"{excel_column_name(first_col)}{first_row}:"
-                f"{excel_column_name(int(frame.columns[-1]) + 1)}{int(frame.index[-1]) + 1}"
-            )
-            self._add_table(
-                document,
-                rows,
-                f"legacy-sheet-{sheet_index}",
-                section_path=[str(sheet_name)],
-                sheet_name=str(sheet_name),
-                cell_range=cell_range,
-                metadata={"legacy_xls": True, "origin": [first_row, first_col], "numeric_repr": "python"},
-            )
+            unit = f"Legacy Excel sheet {sheet_index + 1}/{len(sheets)}: {sheet_name}"
+            with self._timed_unit(document, "parse", unit, sheet_name=str(sheet_name)):
+                frame = frame.dropna(how="all").dropna(axis=1, how="all")
+                if frame.empty:
+                    continue
+                rows = [
+                    ["" if pd.isna(value) else str(value) for value in row]
+                    for row in frame.itertuples(index=False, name=None)
+                ]
+                first_row = int(frame.index[0]) + 1
+                first_col = int(frame.columns[0]) + 1
+                cell_range = (
+                    f"{excel_column_name(first_col)}{first_row}:"
+                    f"{excel_column_name(int(frame.columns[-1]) + 1)}{int(frame.index[-1]) + 1}"
+                )
+                self._add_table(
+                    document,
+                    rows,
+                    f"legacy-sheet-{sheet_index}",
+                    section_path=[str(sheet_name)],
+                    sheet_name=str(sheet_name),
+                    cell_range=cell_range,
+                    metadata={"legacy_xls": True, "origin": [first_row, first_col], "numeric_repr": "python"},
+                )
         return document
 
 

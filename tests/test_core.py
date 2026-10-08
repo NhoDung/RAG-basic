@@ -16,7 +16,7 @@ from rag_kaggle.hardware import configure_ingestion_devices, configure_kaggle_de
 from rag_kaggle.models import Block, ChildChunk, ParsedDocument, SearchHit
 from rag_kaggle.paddleocr_vl import PaddleOCRVLAdapter, pipeline_version_for
 from rag_kaggle.pipeline import IngestionPipeline, PipelineModeError, RetrievalAnswerPipeline
-from rag_kaggle.parsers import classify_excel_region, rows_to_markdown
+from rag_kaggle.parsers import DocumentParser, classify_excel_region, rows_to_markdown
 from rag_kaggle.relationships import build_relationships
 from rag_kaggle.storage import MetadataStore, qdrant_point_id, tokenize_vi
 from rag_kaggle.ui import UploadIngestionGate
@@ -35,6 +35,36 @@ def make_block(block_id, block_type, content, order, **kwargs):
 
 
 class CorePipelineTests(unittest.TestCase):
+    def test_parser_timing_records_metadata_and_progress(self):
+        messages = []
+        parser = DocumentParser(PipelineConfig())
+        parser._progress = messages.append
+        document = ParsedDocument("doc1", "sample.pdf", "pdf", "hash")
+
+        with parser._timed_unit(document, "ocr", "PDF page 1", page=1):
+            pass
+
+        timing = document.metadata["timings"][0]
+        self.assertEqual("ocr", timing["operation"])
+        self.assertEqual("PDF page 1", timing["unit"])
+        self.assertEqual("success", timing["status"])
+        self.assertGreaterEqual(timing["elapsed_seconds"], 0)
+        self.assertTrue(any(message.startswith("[TIMING START] ocr | PDF page 1") for message in messages))
+        self.assertTrue(any("elapsed_seconds=" in message for message in messages))
+
+    def test_generated_notebook_code_cells_have_timing_wrapper(self):
+        notebook_dir = Path(__file__).resolve().parents[1] / "notebooks"
+        for path in notebook_dir.glob("*.ipynb"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            code_cells = [cell for cell in payload["cells"] if cell["cell_type"] == "code"]
+            self.assertTrue(code_cells)
+            for cell in code_cells:
+                source = "".join(cell["source"])
+                self.assertIn("[CELL START]", source)
+                self.assertIn("[CELL END]", source)
+                self.assertIn("[CELL ELAPSED_SECONDS]", source)
+                compile(source, f"{path.name}:cell", "exec")
+
     def test_upload_gate_rejects_repeated_upload_and_parallel_batch(self):
         path = "report.pdf"
         gate = UploadIngestionGate()

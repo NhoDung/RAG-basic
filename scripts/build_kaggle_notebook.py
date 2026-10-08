@@ -1,4 +1,5 @@
 import json
+import textwrap
 from pathlib import Path
 
 
@@ -10,13 +11,31 @@ def markdown(source):
     return {"cell_type": "markdown", "metadata": {}, "source": source.splitlines(keepends=True)}
 
 
-def code(source):
+def code(source, label=None):
+    label = label or "code cell"
+    indented_source = textwrap.indent(source.rstrip(), "    ")
+    timed_source = f'''from datetime import datetime as _CellDateTime
+import time as _cell_time
+
+_cell_label = {label!r}
+_cell_started_at = _CellDateTime.now().astimezone()
+_cell_started_perf = _cell_time.perf_counter()
+print(f"[CELL START] {{_cell_label}} | {{_cell_started_at.isoformat(timespec='seconds')}}")
+try:
+    pass
+{indented_source}
+finally:
+    _cell_finished_at = _CellDateTime.now().astimezone()
+    _cell_elapsed_seconds = _cell_time.perf_counter() - _cell_started_perf
+    print(f"[CELL END] {{_cell_label}} | {{_cell_finished_at.isoformat(timespec='seconds')}}")
+    print(f"[CELL ELAPSED_SECONDS] {{_cell_label}} | {{_cell_elapsed_seconds:.3f}}")
+'''
     return {
         "cell_type": "code",
         "execution_count": None,
         "metadata": {},
         "outputs": [],
-        "source": source.splitlines(keepends=True),
+        "source": timed_source.splitlines(keepends=True),
     }
 
 
@@ -63,7 +82,7 @@ Notebook này chỉ làm **Ingestion**. Nó nhận file, folder Kaggle Dataset h
 """
     ),
     markdown("## 1. Cài đặt và import source"),
-    code(BOOTSTRAP),
+    code(BOOTSTRAP, "01_ingestion / 1. Cài đặt và import source"),
     markdown("## 2. Chọn model trực tiếp và khai báo input"),
     code(
         """# Mỗi phần nhận trực tiếp Hugging Face model ID hoặc tên PaddleOCR.
@@ -86,7 +105,8 @@ INPUT_SOURCES = [KAGGLE_INPUT_ROOT / slug for slug in INPUT_DATASET_SLUGS]
 WORK_DIR = Path("/kaggle/working/rag_ingestion")
 OUTPUT_BUNDLE = Path("/kaggle/working/corpus_bundle.zip")
 INCLUDE_SOURCE_DOCUMENTS = False
-"""
+""",
+        "01_ingestion / 2. Chọn model và khai báo input",
     ),
     markdown("## 3. Cài PaddleOCR-VL trong môi trường riêng"),
     code(
@@ -152,7 +172,8 @@ if INSTALL_OCR:
         print("PaddleOCR-VL setup failed; OCR will be disabled:", exc)
 
 print("OCR_PYTHON =", OCR_PYTHON)
-"""
+""",
+        "01_ingestion / 3. Cài PaddleOCR-VL",
     ),
     markdown("## 4. Tạo ingestion runtime và kiểm tra tài nguyên"),
     code(
@@ -180,7 +201,8 @@ print("Resources:", resources)
 print("Allocation:", configure_ingestion_devices(config))
 print("Suggestions:", suggest_model_upgrades("ingestion", resources, config))
 pipeline = IngestionPipeline(config)
-"""
+""",
+        "01_ingestion / 4. Tạo ingestion runtime",
     ),
     markdown("## 5. Ingest, freeze và export"),
     code(
@@ -217,7 +239,8 @@ print("Bundle:", bundle, f"({bundle.stat().st_size / 1024**2:.1f} MB)")
 
 from IPython.display import FileLink, display
 display(FileLink(str(bundle)))
-"""
+""",
+        "01_ingestion / 5. Ingest, freeze và export",
     ),
 ]
 
@@ -231,7 +254,7 @@ Embedding mặc định được đọc từ manifest của corpus để bảo �
 """
     ),
     markdown("## 1. Cài đặt và import source"),
-    code(BOOTSTRAP),
+    code(BOOTSTRAP, "02_retrieve_answer / 1. Cài đặt và import source"),
     markdown("## 2. Chọn model trực tiếp"),
     code(
         """# None = bắt buộc kế thừa embedding model/revision/query instruction từ corpus manifest.
@@ -245,7 +268,8 @@ SESSION_DIR = Path("/kaggle/working/rag_session")
 
 # Đường dẫn từ Kaggle Dataset. Để None nếu muốn upload bundle trong Gradio.
 CORPUS_BUNDLE = None  # Ví dụ: "/kaggle/input/my-rag-corpus/corpus_bundle.zip"
-"""
+""",
+        "02_retrieve_answer / 2. Chọn model",
     ),
     markdown("## 3. Tạo retrieval runtime và khôi phục corpus"),
     code(
@@ -273,7 +297,8 @@ pipeline = RetrievalAnswerPipeline(config)
 if CORPUS_BUNDLE:
     restored = pipeline.restore_corpus_bundle(CORPUS_BUNDLE)
     print("Corpus:", restored["manifest"])
-"""
+""",
+        "02_retrieve_answer / 3. Tạo retrieval runtime và khôi phục corpus",
     ),
     markdown("## 4. Mở Chat UI"),
     code(
@@ -281,14 +306,16 @@ if CORPUS_BUNDLE:
 
 # Tab System cho phép upload corpus_bundle.zip từ máy cá nhân nếu CORPUS_BUNDLE=None.
 launch_chat_demo(pipeline, share=True, debug=False)
-"""
+""",
+        "02_retrieve_answer / 4. Mở Chat UI",
     ),
     markdown("## 5. API Python trực tiếp"),
     code(
         """# result = pipeline.ask("Phí thường niên của thẻ Visa Gold là bao nhiêu?")
 # print(result["answer"], result["citations"])
 # metrics = pipeline.evaluate("/kaggle/input/my-evaluation/dataset.jsonl")
-"""
+""",
+        "02_retrieve_answer / 5. API Python trực tiếp",
     ),
 ]
 

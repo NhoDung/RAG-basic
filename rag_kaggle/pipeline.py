@@ -148,11 +148,21 @@ class RAGPipeline:
         if not paths:
             raise ValueError("No input files")
         run_id = uuid.uuid4().hex[:12]
+        run_started_at = dt.datetime.now(dt.timezone.utc)
+        run_started_perf = time.perf_counter()
         notify = progress or (lambda message: None)
-        report: dict[str, Any] = {"run_id": run_id, "documents": [], "skipped": [], "errors": [], "statuses": []}
-        notify(f"Starting ingestion: {len(paths)} file(s).")
+        report: dict[str, Any] = {
+            "run_id": run_id,
+            "started_at": run_started_at.isoformat(timespec="seconds"),
+            "documents": [],
+            "skipped": [],
+            "errors": [],
+            "statuses": [],
+        }
+        notify(f"Starting ingestion: {len(paths)} file(s) | {report['started_at']}")
 
         def record(stage, status, source=None, document_id=None, error_code=None, message=None, retryable=False, started=None):
+            duration_ms = round((time.perf_counter() - started) * 1000, 1) if started else None
             item = StageStatus(
                 stage=stage,
                 status=status,
@@ -161,11 +171,12 @@ class RAGPipeline:
                 error_code=error_code,
                 message=message,
                 retryable=retryable,
-                duration_ms=round((time.perf_counter() - started) * 1000, 1) if started else None,
+                duration_ms=duration_ms,
             )
             self.metadata.record_status(item, run_id)
             report["statuses"].append(item.to_dict())
-            notify(f"[{stage}] {status}: {source or ''} {message or ''}".strip())
+            elapsed = f" elapsed_seconds={duration_ms / 1000:.3f}" if duration_ms is not None else ""
+            notify(f"[{stage}] {status}: {source or ''} {message or ''}{elapsed}".strip())
 
         if reset:
             self.metadata.reset()
@@ -283,8 +294,13 @@ class RAGPipeline:
 
         report["stats"] = self.metadata.stats()
         report["ok"] = not report["errors"]
+        report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        report["elapsed_seconds"] = round(time.perf_counter() - run_started_perf, 3)
         self._write_manifest(report)
-        notify("Hoàn tất ingestion.")
+        notify(
+            f"Hoàn tất ingestion | {report['finished_at']} | "
+            f"elapsed_seconds={report['elapsed_seconds']:.3f}"
+        )
         return report
 
     def _write_manifest(self, report: dict) -> Path:
