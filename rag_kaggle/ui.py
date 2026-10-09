@@ -107,7 +107,7 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
     def respond(message, history, source_file, content_type):
         history = list(history or [])
         if not message or not message.strip():
-            return history, "", [], [], {}, ""
+            return history, "", [], [], {}, "", []
         filters = {
             "source_file": None if source_file in (None, ALL) else source_file,
             "chunk_type": None if content_type in (None, ALL) else content_type,
@@ -116,7 +116,7 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
             result = pipeline.ask(message, filters=filters)
         except Exception as exc:
             history += [{"role": "user", "content": message}, {"role": "assistant", "content": f"Pipeline error: {exc}"}]
-            return history, "", [], [], {}, ""
+            return history, "", [], [], {}, "", []
 
         answer = result["answer"]
         if result.get("citations"):
@@ -144,15 +144,25 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
             for path in context.get("asset_paths", []):
                 if Path(path).suffix.lower() in IMAGE_SUFFIXES and Path(path).exists():
                     images.append((path, context["citation"]))
+        table_files = list(
+            dict.fromkeys(
+                context["table_file"]
+                for context in result.get("contexts", [])
+                if context.get("table_file") and Path(context["table_file"]).exists()
+            )
+        )
         contexts_md = "\n\n".join(
             f"**{context['source_id']}** {context['citation']}\n```text\n{context['preview']}\n```"
             for context in result.get("contexts", [])
         )
         trace = {
             key: result.get(key)
-            for key in ("trace_id", "query_plan", "filters", "computation", "latency_ms", "refusal_reason", "source_ids")
+            for key in (
+                "trace_id", "query_plan", "query_entities", "filters", "computation", "latency_ms",
+                "refusal_reason", "source_ids",
+            )
         }
-        return history, "", rows, images, trace, contexts_md
+        return history, "", rows, images, trace, contexts_md, table_files
 
     def run_evaluation(dataset, run_answers):
         if not dataset:
@@ -212,6 +222,8 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
                     contexts_view = gr.Markdown()
                 with gr.Accordion("Preview nguồn (ảnh trang/hình)", open=False):
                     gallery = gr.Gallery(columns=3, height=360)
+                with gr.Accordion("Bảng đầy đủ (.xlsx)", open=False):
+                    table_files_view = gr.File(label="Bảng lớn được dùng làm nguồn", file_count="multiple")
                 with gr.Accordion("Trace", open=False):
                     trace_view = gr.JSON()
 
@@ -238,7 +250,7 @@ def build_demo(pipeline: RAGPipeline, include_ingestion: bool = True, include_ch
             ingest_outputs = [stage_log, ingest_report, artifact, documents]
             ingest_button.click(ingest_files, inputs=[files, reset], outputs=ingest_outputs)
         if include_chat:
-            chat_outputs = [chatbot, question, hits_table, gallery, trace_view, contexts_view]
+            chat_outputs = [chatbot, question, hits_table, gallery, trace_view, contexts_view, table_files_view]
             chat_inputs = [question, chatbot, source_filter, type_filter]
             ask_button.click(respond, inputs=chat_inputs, outputs=chat_outputs)
             question.submit(respond, inputs=chat_inputs, outputs=chat_outputs)

@@ -460,6 +460,7 @@ class RAGPipeline:
                 "query_variants": plan.semantic_queries,
                 "query_plan": plan.to_dict(),
                 "filters": applied_filters,
+                "query_entities": entity_matches,
                 "trace": hit_rows,
                 "contexts": [
                     {
